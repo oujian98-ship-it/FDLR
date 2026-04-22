@@ -1,0 +1,393 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+FedDiffuse 统一入口程序
+
+统一管理两种训练方法的运行：
+  - fedavg: 原始 FedAvg 全参训练 (federator.py)
+  - lora:   异构 LoRA 联邦微调 (lora_federator.py)
+
+用法:
+    python main.py --dataset celeba
+    python main.py --preset celeba_lora_quick
+    python main.py --method fedavg --dataset celeba
+"""
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+# ============================================================
+# 0. 路径设置
+# ============================================================
+PROJECT_ROOT = Path(__file__).parent
+SRC_DIR = PROJECT_ROOT / 'src'
+str_src = str(SRC_DIR)
+if str_src not in sys.path:
+    sys.path.insert(0, str_src)
+
+
+# ============================================================
+# 1. 超参数配置 (修改这里的默认值即可)
+# ============================================================
+
+# ---- 数据集选择 ----
+DATASET = 'fmnist'          # 数据集: celeba | fmnist
+DATA_ROOT = ''                 # 自定义数据路径 (留空则根据 DATASET 自动匹配)
+
+# ---- 训练方法选择 ----
+METHOD = 'lora'             # 方法: lora | fedavg
+
+# ---- 联邦学习超参 ----
+ROUNDS = 15                 # 全局训练轮数 R
+NUM_USERS = 10               # 客户端数量 K
+FRAC = 1.0                  # 每轮参与客户端比例 C
+LOCAL_EP = 5                # 本地训练轮次 E
+LOCAL_BS = 128              # 本地 batch size B
+IID = 1                     # IID=1 / Non-IID=0
+UNEQUAL = 0                 # 非均匀分布=1
+
+# ---- 扩散模型超参 ----
+TRAIN_MODE = 1              # 训练=1 / 推理=0
+LOAD_MODEL = ''             # 预加载模型路径 (留空自动根据数据集选择)
+TIME_STEPS = 1000           # 扩散步数 T
+CONDITIONAL = -1            # 条件生成 (=-1按数据集自动: FMNIST=1, CelebA=0)
+LR = 1e-4                   # 学习率 (扩散模型建议不要超过 1e-4)
+OPTIMIZER = 'adam'          # 优化器
+
+# ---- LoRA 专用 (仅 METHOD=lora 时生效) ----
+LORA_RANK = 32               # 基础 LoRA rank
+LORA_RANKS = ''             # 各客户端逗号分隔的 rank, 如 "4,8,16,8,4" (留空则全部用 LORA_RANK)
+GLOBAL_LORA_RANK = 32       # 服务端全局 rank
+LORA_ALPHA = 0.8            # LoRA 缩放因子 α
+LORA_DROPOUT = 0.1          # LoRA dropout
+
+FEDAVG_TRAIN_MODE = 'full'  # full | usplit | udec | ulatdec
+MOMENTUM = 0.5              # SGD momentum
+ROUND_OFFSET = 0            # 轮次编号偏移
+
+# ---- 导出/采样 ----
+EXPORT_SAMPLES = 0          # 生成图片数量
+EXPORT_DATASET = 0          # 导出真实数据样本数 (FID参照)
+SHOW_SAMPLES = 0            # 展示样本
+EXP_ROUNDS = 0              # 中间轮次导出间隔
+
+# ---- DDIM 加速采样 ----
+USE_DDIM = 1                # 使用 DDIM 采样 (1=开启, 0=关闭/使用 DDPM)
+DDIM_STEPS = 100            # DDIM 采样步数 (默认 100, 建议 50-100)
+
+
+# ============================================================
+# 2. 数据集自动匹配表
+# ============================================================
+
+DATASET_CONFIGS = {
+    'fmnist': {
+        'image_size': 28,
+        'num_channels': 1,
+        'num_classes': 10,
+        'conditional': 1,           # FMNIST 必须用条件生成
+        'default_model': 'model_fmnist.pth',
+        'data_root': r'D:\data\fashion-mnist-master',
+    },
+    'celeba': {
+        'image_size': 64,
+        'num_channels': 3,
+        'num_classes': 16,
+        'conditional': 0,           # CelebA 无条件即可
+        'default_model': 'model_celeba.pth',
+        'data_root': r'D:\data\CelebA',
+    },
+}
+
+
+def get_dataset_config(dataset_name):
+    """根据数据集名称获取默认配置"""
+    if dataset_name not in DATASET_CONFIGS:
+        available = ', '.join(DATASET_CONFIGS.keys())
+        print(f'[Error] Unknown dataset "{dataset_name}", available: {available}')
+        sys.exit(1)
+    return DATASET_CONFIGS[dataset_name]
+
+
+def auto_data_root(dataset_name):
+    """根据数据集自动匹配数据路径（用户未手动指定时使用）"""
+    if DATA_ROOT:
+        return DATA_ROOT  # 用户在顶部手动指定了，优先使用
+    ds_cfg = get_dataset_config(dataset_name)
+    return ds_cfg.get('data_root', '')
+
+
+def auto_select_model(dataset_name):
+    """根据数据集自动选择预加载模型"""
+    if LOAD_MODEL:
+        return LOAD_MODEL
+    config = get_dataset_config(dataset_name)
+    model_path = PROJECT_ROOT / config['default_model']
+    if not model_path.exists():
+        print(f'[Warning] Model file not found: {model_path}')
+        return ''
+    return config['default_model']
+
+
+# ============================================================
+# 3. 预设配置 (Presets) — 可用 --preset 快速切换
+# ============================================================
+
+PRESETS = {
+    'celeba_lora_quick': {
+        'description': 'CelebA LoRA 快速实验 (R=10, ~2.5h)',
+        'method': 'lora', 'dataset': 'celeba',
+        'rounds': 10, 'num_users': 5, 'local_ep': 3, 'local_bs': 128,
+        'lr': 1e-4,
+        'lora_rank': 8, 'global_lora_rank': 16,
+        'train': 1,
+    },
+    'celeba_lora_paper_align': {
+        'description': 'CelebA LoRA 对齐论文 (R=30, E=5, B=64, ~7.5h)',
+        'method': 'lora', 'dataset': 'celeba',
+        'rounds': 30, 'num_users': 5, 'local_ep': 5, 'local_bs': 64,
+        'lr': 1e-4,
+        'lora_rank': 8, 'global_lora_rank': 16,
+        'train': 1,
+    },
+    'celeba_fedavg_baseline': {
+        'description': 'CelebA FedAvg Baseline 论文对齐 (R=30, ~37h)',
+        'method': 'fedavg', 'dataset': 'celeba',
+        'rounds': 30, 'num_users': 5, 'local_ep': 5, 'local_bs': 64,
+        'lr': 1e-4,
+        'train_mode': 'full',
+        'train': 1,
+    },
+    'celeba_fedavg_quick': {
+        'description': 'CelebA FedAvg 快速 Baseline (R=10, ~8h)',
+        'method': 'fedavg', 'dataset': 'celeba',
+        'rounds': 10, 'num_users': 5, 'local_ep': 3, 'local_bs': 128,
+        'lr': 1e-4,
+        'train_mode': 'full',
+        'train': 1,
+    },
+    'fmnist_lora_quick': {
+        'description': 'Fashion-MNIST LoRA 快速实验',
+        'method': 'lora', 'dataset': 'fmnist',
+        'rounds': 10, 'num_users': 5, 'local_ep': 3, 'local_bs': 128,
+        'lr': 1e-4,
+        'lora_rank': 8, 'global_lora_rank': 16,
+        'train': 1,
+    },
+    'infer_celeba': {
+        'description': 'CelebA 推理: 生成图片 + FID评估',
+        'method': 'lora', 'dataset': 'celeba',
+        'train': 0,
+        'load_model': 'flora_model_celeba_R[10]_K[5]_E[3].pth',
+        'export_samples': 5000, 'export_dataset': 5000,
+    },
+    'infer_fmnist': {
+        'description': 'FMNIST 推理: 生成图片 + FID评估',
+        'method': 'lora', 'dataset': 'fmnist',
+        'train': 0,
+        'load_model': 'flora_model_fmnist_R[30]_K[5]_E[5].pth',
+        'export_samples': 5000, 'export_dataset': 5000,
+    },
+}
+
+
+def apply_preset(preset_name):
+    if preset_name not in PRESETS:
+        available = ', '.join(PRESETS.keys())
+        print(f'[Error] Unknown preset "{preset_name}"')
+        print(f'Available presets: {available}')
+        sys.exit(1)
+    p = PRESETS[preset_name]
+    print(f'\n{"="*60}')
+    print(f'Preset: {preset_name} → {p["description"]}')
+    print(f'{"="*60}\n')
+    return p
+
+
+# ============================================================
+# 4. 参数构建与解析
+# ============================================================
+
+def build_args_from_config():
+    """从顶部配置 + 数据集自动匹配 构建 Namespace"""
+    ds_cfg = get_dataset_config(DATASET)
+
+    args = argparse.Namespace(
+        # 核心选择
+        method=METHOD,
+        preset='',
+        # 数据集 (自动填充 image_size/num_channels/num_classes/data_root)
+        dataset=DATASET,
+        data_root=auto_data_root(DATASET),
+        image_size=ds_cfg['image_size'],
+        num_channels=ds_cfg['num_channels'],
+        num_classes=ds_cfg['num_classes'],
+        # 联邦学习
+        rounds=ROUNDS,
+        num_users=NUM_USERS,
+        frac=FRAC,
+        local_ep=LOCAL_EP,
+        local_bs=LOCAL_BS,
+        iid=IID,
+        unequal=UNEQUAL,
+        # 扩散模型
+        train=TRAIN_MODE,
+        load_model=auto_select_model(DATASET),
+        time_steps=TIME_STEPS,
+        conditional=ds_cfg.get('conditional', CONDITIONAL),  # 按数据集自动匹配
+        lr=LR,
+        optimizer=OPTIMIZER,
+        # 导出
+        export_samples=EXPORT_SAMPLES,
+        export_dataset=EXPORT_DATASET,
+        show_samples=SHOW_SAMPLES,
+        exp_rounds=EXP_ROUNDS,
+        # LoRA
+        lora_rank=LORA_RANK,
+        lora_ranks=LORA_RANKS,
+        global_lora_rank=GLOBAL_LORA_RANK,
+        lora_alpha=LORA_ALPHA,
+        lora_dropout=LORA_DROPOUT,
+        # FedAvg
+        train_mode=FEDAVG_TRAIN_MODE,
+        momentum=MOMENTUM,
+        round_offset=ROUND_OFFSET,
+        # DDIM
+        use_ddim=USE_DDIM,
+        ddim_steps=DDIM_STEPS,
+    )
+    return args
+
+
+def apply_cli_overrides(args):
+    """命令行参数覆盖配置文件默认值"""
+    parser = argparse.ArgumentParser(description='FedDiffuse', add_help=False)
+
+    # 只注册可覆盖的参数，不设 default（保留 args 中的值）
+    parser.add_argument('--method', type=str)
+    parser.add_argument('--preset', type=str, default='')
+    parser.add_argument('--dataset', type=str)
+    parser.add_argument('--data_root', type=str)
+    parser.add_argument('--image_size', type=int)
+    parser.add_argument('--num_channels', type=int)
+    parser.add_argument('--num_classes', type=int)
+    parser.add_argument('--rounds', type=int)
+    parser.add_argument('--num_users', type=int)
+    parser.add_argument('--frac', type=float)
+    parser.add_argument('--local_ep', type=int)
+    parser.add_argument('--local_bs', type=int)
+    parser.add_argument('--iid', type=int)
+    parser.add_argument('--unequal', type=int)
+    parser.add_argument('--train', type=int)
+    parser.add_argument('--load_model', type=str)
+    parser.add_argument('--time_steps', type=float)
+    parser.add_argument('--conditional', type=int)
+    parser.add_argument('--lr', type=float)
+    parser.add_argument('--optimizer', type=str)
+    parser.add_argument('--export_samples', type=int)
+    parser.add_argument('--export_dataset', type=int)
+    parser.add_argument('--show_samples', type=int)
+    parser.add_argument('--exp_rounds', type=int)
+    parser.add_argument('--lora_rank', type=int)
+    parser.add_argument('--lora_ranks', type=str)
+    parser.add_argument('--global_lora_rank', type=int)
+    parser.add_argument('--lora_alpha', type=float)
+    parser.add_argument('--lora_dropout', type=float)
+    parser.add_argument('--train_mode', type=str)
+    parser.add_argument('--momentum', type=float)
+    parser.add_argument('--round_offset', type=int)
+    parser.add_argument('--use_ddim', type=int)
+    parser.add_argument('--ddim_steps', type=int)
+
+    cli_args, _ = parser.parse_known_args()
+
+    for key, val in vars(cli_args).items():
+        if val is not None:
+            setattr(args, key, val)
+
+    # 处理预设
+    if args.preset:
+        preset = apply_preset(args.preset)
+        for key, value in preset.items():
+            if key != 'description' and hasattr(args, key):
+                setattr(args, key, value)
+
+    # 如果通过 --dataset 切换了数据集，重新自动匹配
+    if hasattr(args, 'dataset') and args.dataset:
+        ds_cfg = get_dataset_config(args.dataset)
+        _is_preset_loaded = bool(args.preset)  # preset 已设置过的不应被覆盖
+        # 仅在用户未显式指定时自动填充
+        # (CLI 中未传 image_size 等时保持 auto 匹配)
+        if '--image_size' not in sys.argv and '--num_channels' not in sys.argv:
+            args.image_size = ds_cfg['image_size']
+            args.num_channels = ds_cfg['num_channels']
+            args.num_classes = ds_cfg['num_classes']
+        if '--conditional' not in sys.argv and not _is_preset_loaded:
+            args.conditional = ds_cfg.get('conditional', 0)
+        if '--load_model' not in sys.argv and not _is_preset_loaded:
+            args.load_model = auto_select_model(args.dataset)
+        if '--data_root' not in sys.argv and (not DATA_ROOT):
+            args.data_root = ds_cfg.get('data_root', '')
+
+    return args
+
+
+def print_config_summary(args):
+    """打印当前运行配置摘要"""
+    method_tag = 'LoRA-FedDiffuse' if args.method == 'lora' else 'FedAvg-Baseline'
+    mode_tag = 'TRAIN' if args.train == 1 else 'INFERENCE'
+    ds_info = f"{args.dataset.upper()} {args.image_size}x{args.image_size} ch={args.num_channels}"
+
+    extra = []
+    if args.method == 'lora':
+        extra.append(f"rank={args.lora_rank}(client)/{args.global_lora_rank}(global)")
+    elif hasattr(args, 'train_mode'):
+        extra.append(f"mode={args.train_mode}")
+
+    print(f'\n{"═"*56}')
+    print(f'  FedDiffuse  │  {method_tag:<20}│  {mode_tag:<10}')
+    print(f'{"─"*56}')
+    print(f'  Dataset     :  {ds_info}')
+    print(f'  Rounds      :  R={args.rounds},  K={args.num_users},  E={args.local_ep},  B={args.local_bs}')
+    print(f'  Data dist.  :  {"IID" if args.iid else "Non-IID"}  |  lr={args.lr}')
+    if extra:
+        print(f'  Method spec :  {"  |  ".join(extra)}')
+    if args.data_root:
+        print(f'  Data root   :  {args.data_root}')
+    print(f'  Load model  :  {args.load_model or "(none)"}')
+    print(f'  Sampling    :  {"DDIM (steps=" + str(args.ddim_steps) + ")" if args.use_ddim else "DDPM (steps=" + str(int(args.time_steps)) + ")"}')
+    print(f'{"═"*56}\n')
+
+
+# ============================================================
+# 5. 运行入口
+# ============================================================
+
+def run_fedavg(args):
+    from federator import main as fedavg_main
+    fedavg_main(args)
+
+
+def run_lora(args):
+    from lora_federator import main as lora_main
+    lora_main(args)
+
+
+def main():
+    # 从配置文件构建基础参数
+    args = build_args_from_config()
+    # CLI 覆盖
+    args = apply_cli_overrides(args)
+    # 打印摘要
+    print_config_summary(args)
+    # 分发执行
+    if args.method == 'fedavg':
+        run_fedavg(args)
+    else:
+        run_lora(args)
+
+
+if __name__ == '__main__':
+    main()

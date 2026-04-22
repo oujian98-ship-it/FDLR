@@ -1,0 +1,15 @@
+torch
+torchvision
+torchaudio
+numpy
+tensorboardx
+matplotlib
+tqdm
+einops
+datasets
+pytorch_fid
+diffusers
+scipy
+Pillow
+scikit-learn
+seaborn
