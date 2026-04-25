@@ -47,7 +47,7 @@ if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
 from diffuser import Diffuser
-from hetero_aggregation import HeteroLoRAAggregator
+from hetero_aggregation import HeteroLoRAAggregator, prefix_slice_distribution
 from lora import (
     inject_lora_into_unet,
     extract_all_lora_factors,
@@ -108,6 +108,19 @@ def parse_lora_ranks(rank_str: str, num_clients: int, default_rank: int = 8) -> 
         return {i: r for i, r in enumerate(ranks)}
     else:
         return {i: int(rank_str.strip()) for i in range(num_clients)}
+
+
+def factors_list_to_nested_dict(factors):
+    """
+    Convert [(layer_name, B_dict, A_dict), ...] to
+    B_nested={layer_name:{factor_key:B}}, A_nested={layer_name:{factor_key:A}}.
+    """
+    B_nested = {}
+    A_nested = {}
+    for layer_name, B_dict, A_dict in factors:
+        B_nested[layer_name] = {k: v.detach().clone() for k, v in B_dict.items()}
+        A_nested[layer_name] = {k: v.detach().clone() for k, v in A_dict.items()}
+    return B_nested, A_nested
 
 
 def build_base_model(args, device: str):
@@ -186,8 +199,8 @@ def run_training(args):
     train_dataset, client_groups, data_stats = get_partitioned_dataset(args)
     print(f'Dataset stats: {data_stats}')
 
-    # ---- Build base diffusion model ----
-    base_model = build_base_model(args, device)
+    # ---- Build clean base diffusion model ----
+    base_model_clean = build_base_model(args, device)
 
     # ---- Detect if loaded model is a LoRA-trained checkpoint ----
     _load_path = parent_path / args.load_model if args.load_model else None
@@ -202,41 +215,54 @@ def run_training(args):
         except Exception:
             pass
 
-    # ---- Inject LoRA into base model (skip if already a LoRA checkpoint) ----
-    global_rank = getattr(args, 'global_lora_rank', getattr(args, 'lora_rank', 8))
+    # ---- Parse heterogeneous rank configuration first ----
+    lora_rank_str = getattr(args, 'lora_ranks', str(getattr(args, 'lora_rank', 8)))
+    client_rank_map = parse_lora_ranks(
+        lora_rank_str,
+        args.num_users,
+        default_rank=getattr(args, 'lora_rank', 8),
+    )
+
+    global_rank = int(getattr(args, 'global_lora_rank', max(client_rank_map.values())))
+    max_client_rank = max(client_rank_map.values())
+    if global_rank < max_client_rank:
+        raise ValueError(
+            f'global_lora_rank must be >= max client rank. '
+            f'Got global_lora_rank={global_rank}, max_client_rank={max_client_rank}'
+        )
+
+    # ---- Server model: global-rank LoRA model for aggregation/checkpoint/sampling ----
+    server_model = copy.deepcopy(base_model_clean)
     if not _is_lora_checkpoint:
         inject_lora_into_unet(
-            base_model,
-            rank=getattr(args, 'lora_rank', 8),
+            server_model,
+            rank=global_rank,
             alpha=getattr(args, 'lora_alpha', 1.0),
             dropout=getattr(args, 'lora_dropout', 0.0),
-            target_layers='attention',
+            target_layers=getattr(args, 'lora_target_layers', 'attention'),
         )
     else:
         # Ensure existing LoRA params are trainable
-        for p in base_model.parameters():
+        for p in server_model.parameters():
             p.requires_grad = True
         # Re-inject fresh LoRA on top of existing one (for continued training)
         inject_lora_into_unet(
-            base_model,
-            rank=getattr(args, 'lora_rank', 8),
+            server_model,
+            rank=global_rank,
             alpha=getattr(args, 'lora_alpha', 1.0),
             dropout=getattr(args, 'lora_dropout', 0.0),
-            target_layers='attention',
+            target_layers=getattr(args, 'lora_target_layers', 'attention'),
         )
 
-    num_params = sum(p.numel() for p in base_model.parameters())
-    lora_params = sum(p.numel() for p in base_model.parameters() if p.requires_grad)
-    print(f'\nBase model: {num_params:,} total params, {lora_params:,} LoRA trainable '
+    num_params = sum(p.numel() for p in server_model.parameters())
+    lora_params = sum(p.numel() for p in server_model.parameters() if p.requires_grad)
+    print(f'\nServer model: {num_params:,} total params, {lora_params:,} global LoRA trainable '
           f'({100*lora_params/num_params:.2f}%)')
 
     # ---- Initialize diffuser ----
     diffuser = Diffuser(int(args.time_steps))
 
-    # ---- Parse heterogeneous rank configuration ----
-    lora_rank_str = getattr(args, 'lora_ranks', str(getattr(args, 'lora_rank', 8)))
-    client_rank_map = parse_lora_ranks(lora_rank_str, args.num_users, 
-                                          default_rank=getattr(args, 'lora_rank', 8))
+    # ---- Heterogeneous rank configuration ----
     print(f'\nClient LoRA rank config:')
     for cid, r in sorted(client_rank_map.items()):
         n_data = len(client_groups.get(cid, []))
@@ -249,6 +275,12 @@ def run_training(args):
         use_procrustes=True,
         svd_method='rsvd',
     )
+
+    # Initialize client LoRA factors from the same server global subspace, even in round 0.
+    # This is necessary for nested prefix distribution to be true from the beginning.
+    init_factors = extract_all_lora_factors(server_model)
+    B_init, A_init = factors_list_to_nested_dict(init_factors)
+    aggregator._last_distribution = prefix_slice_distribution(B_init, A_init, client_rank_map)
 
     # ---- Setup output directories ----
     _lr = getattr(args, 'lora_rank', 8)
@@ -297,31 +329,27 @@ def run_training(args):
                 client_cache[client_id] = LoRAClient(
                     args=args,
                     dataset=train_dataset,
-                    base_model=base_model,  # deep-copied inside constructor
+                    base_model=base_model_clean,  # clean model; LoRAClient injects local rank itself
                     indices=client_groups[client_id],
                     time_steps=int(args.time_steps),
                     diffuser=diffuser,
                     lora_rank=client_rank_map.get(client_id, 8),
+                    lora_alpha=getattr(args, 'lora_alpha', 1.0),
                 )
             
             client = client_cache[client_id]
 
-            # Receive server update from previous round (skip round 0 -> random init)
-            if round_idx > 0 and hasattr(aggregator, '_last_distribution'):
-                server_upd = aggregator._last_distribution.get(client_id)
-                if server_upd is not None:
-                    B_serv, A_serv = server_upd
-                    # Convert to format expected by set_all_lora_factors
-                    server_factors = [
-                        (layer_name, B_serv[layer_name], A_serv[layer_name])
-                        for layer_name in B_serv
-                    ]
-                    client.receive_server_update(server_factors)
-                else:
-                    client.receive_server_update(None)
-            elif round_idx == 0:
-                # Round 0: keep random initialization
-                pass
+            # Receive server prefix distribution. Round 0 also receives the initial prefix distribution.
+            server_upd = getattr(aggregator, '_last_distribution', {}).get(client_id)
+            if server_upd is not None:
+                B_serv, A_serv = server_upd
+                server_factors = [
+                    (layer_name, B_serv[layer_name], A_serv[layer_name])
+                    for layer_name in B_serv
+                ]
+                client.receive_server_update(server_factors)
+            else:
+                client.receive_server_update(None)
 
             # Local training
             factors, loss = client.train_local()
@@ -342,8 +370,8 @@ def run_training(args):
         # Cache distribution for next round's client receive step
         aggregator._last_distribution = agg_result['client_updates']
 
-        # Apply aggregated global factors back to base_model for checkpointing/sampling
-        set_all_lora_factors(base_model, [
+        # Apply aggregated global factors back to server_model for checkpointing/sampling
+        set_all_lora_factors(server_model, [
             (name, agg_result['global_B'][name], agg_result['global_A'][name])
             for name in agg_result['global_B']
         ])
@@ -361,7 +389,7 @@ def run_training(args):
         # ---- Save checkpoints ----
         if round_idx % max(1, args.rounds // 5) == 0 or round_idx == args.rounds - 1:
             ckpt_path = result_folder / f'{model_name}_R[{round_idx}].pth'
-            save_lora_checkpoint(base_model, ckpt_path, round_idx)
+            save_lora_checkpoint(server_model, ckpt_path, round_idx)
 
         # ---- Intermediate sampling ----
         if (args.exp_rounds > 0 and 
@@ -370,7 +398,7 @@ def run_training(args):
             sample_folder = parent_path / f'exports/{model_name}_R[{round_idx}]'
             export_samples(
                 diffuser, sample_folder,
-                bool(args.conditional), base_model, int(args.time_steps),
+                bool(args.conditional), server_model, int(args.time_steps),
                 args.image_size, args.num_channels, args.num_classes,
                 args.exp_rounds,
                 use_ddim=bool(getattr(args, 'use_ddim', 1)),
@@ -379,13 +407,13 @@ def run_training(args):
 
     # ---- Final save ----
     final_path = result_folder / f'{model_name}.pth'
-    save_lora_checkpoint(base_model, final_path)
+    save_lora_checkpoint(server_model, final_path)
     
     # Save to project root with hyperparam tags
     _lr = getattr(args, 'lora_rank', 8)
     final_model_name = f'flora_model_{args.dataset}_R[{args.rounds}]_K[{args.num_users}]_E[{args.local_ep}]'
     final_model_path = parent_path / f'{final_model_name}.pth'
-    save_lora_checkpoint(base_model, final_model_path)
+    save_lora_checkpoint(server_model, final_model_path)
     print(f'\nFinal model saved: {final_model_path}')
 
     # ---- Export loss CSV ----

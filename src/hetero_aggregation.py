@@ -381,7 +381,7 @@ def procrustes_alignment(
             if Q.shape[0] >= r:
                 Q_k = Q[:r, :r].to(B_new[key].device)
                 B_aligned[key] = B_new[key] @ Q_k
-                A_aligned[key] = A_new[key] @ Q_k.t().to(A_new[key].device)
+                A_aligned[key] = Q_k.t().to(A_new[key].device) @ A_new[key]
             else:
                 B_aligned[key] = B_new[key].clone()
                 A_aligned[key] = A_new[key].clone()
@@ -549,6 +549,29 @@ def prefix_slice_distribution(
 # Complete Aggregation Pipeline (End-to-End)
 # ============================================================
 
+def count_factor_list_bytes(
+    factors: List[Tuple[str, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]],
+    bytes_per_param: int = 4,
+) -> int:
+    total_elems = 0
+    for _, B_dict, A_dict in factors:
+        total_elems += sum(t.numel() for t in B_dict.values())
+        total_elems += sum(t.numel() for t in A_dict.values())
+    return total_elems * bytes_per_param
+
+
+def count_client_distribution_bytes(
+    client_updates: Dict[int, Tuple[Dict[str, Dict[str, torch.Tensor]], Dict[str, Dict[str, torch.Tensor]]]],
+    bytes_per_param: int = 4,
+) -> int:
+    total_elems = 0
+    for B_client, A_client in client_updates.values():
+        for layer_name, B_dict in B_client.items():
+            A_dict = A_client.get(layer_name, {})
+            total_elems += sum(t.numel() for t in B_dict.values())
+            total_elems += sum(t.numel() for t in A_dict.values())
+    return total_elems * bytes_per_param
+
 class HeteroLoRAAggregator:
     """
     Full heterogeneous LoRA aggregation pipeline combining all steps.
@@ -641,26 +664,12 @@ class HeteroLoRAAggregator:
         client_updates = prefix_slice_distribution(B_aligned, A_aligned, client_ranks)
         
         # Stats
-        # client_factors_list: List[Tuple[int, List[Tuple[str, Dict, Dict]]]]
-        #   each element: (client_id, [(layer_name, B_dict, A_dict), ...])
         total_up_bytes = sum(
-            sum(
-                t.numel() * 2  # both B and A tensors
-                for _, b_dict, a_dict in factors
-                for t in b_dict.values()
-            )
+            count_factor_list_bytes(factors)
             for _, factors in client_factors_list
-        ) * 4 if client_factors_list else 0
-        
-        total_down_bytes = sum(
-            sum(
-                b.numel() + a.numel()
-                for layer_name in b_c
-                for b in b_c[layer_name].values()
-                for a in a_c[layer_name].values()
-            )
-            for b_c, a_c in client_updates.values()
-        ) * 4 if client_updates else 0
+        ) if client_factors_list else 0
+
+        total_down_bytes = count_client_distribution_bytes(client_updates) if client_updates else 0
         
         stats['upload_bytes'] = total_up_bytes
         stats['download_bytes'] = total_down_bytes

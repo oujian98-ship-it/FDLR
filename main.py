@@ -41,10 +41,10 @@ METHOD = 'lora'             # 方法: lora | fedavg
 
 # ---- 联邦学习超参 ----
 ROUNDS = 15                 # 全局训练轮数 R
-NUM_USERS = 10               # 客户端数量 K
+NUM_USERS = 2               # 客户端数量 K
 FRAC = 1.0                  # 每轮参与客户端比例 C
 LOCAL_EP = 5                # 本地训练轮次 E
-LOCAL_BS = 128              # 本地 batch size B
+LOCAL_BS = 64              # 本地 batch size B
 IID = 1                     # IID=1 / Non-IID=0
 UNEQUAL = 0                 # 非均匀分布=1
 
@@ -187,7 +187,7 @@ PRESETS = {
         'description': 'FMNIST 推理: 生成图片 + FID评估',
         'method': 'lora', 'dataset': 'fmnist',
         'train': 0,
-        'load_model': 'flora_model_fmnist_R[30]_K[5]_E[5].pth',
+        'load_model': 'flora_model_fmnist_R[15]_K[2]_E[5].pth',
         'export_samples': 5000, 'export_dataset': 5000,
     },
 }

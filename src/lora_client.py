@@ -18,6 +18,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from lora import (
+    inject_lora_into_unet,
     extract_all_lora_factors,
     set_all_lora_factors,
     get_lora_state_dict,
@@ -68,9 +69,22 @@ class LoRAClient:
         self.time_steps = time_steps
         self.diffuser = diffuser
 
-        # Create local model by deep-copying the injected base model
+        # Create local model from a clean base model and inject this client's own LoRA rank.
         self.local_model = copy.deepcopy(base_model)
         
+        if hasattr(self.local_model, '_lora_config'):
+            raise ValueError(
+                'LoRAClient expects a clean base model without LoRA. '
+                'Pass base_model_clean, not server_model/global LoRA model.'
+            )
+            
+        inject_lora_into_unet(
+            self.local_model,
+            rank=self.lora_rank,
+            alpha=self.lora_alpha,
+            dropout=getattr(self.args, 'lora_dropout', 0.0),
+            target_layers=getattr(self.args, 'lora_target_layers', 'attention'),
+        )
         # Setup data loader
         self.train_loader = DataLoader(
             LoRADatasetSplit(dataset, indices),

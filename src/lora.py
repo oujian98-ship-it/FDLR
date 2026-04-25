@@ -69,16 +69,14 @@ class LoRAConv2d(nn.Module):
         # Original frozen path
         result = self.conv(x)
         
-        # LoRA path: treat Conv2d(1x1) as linear transform
-        # x: [B, C_in, H, W], weight is [C_out, C_in]
-        b, c_in, h, w = x.shape
-        x_flat = x.reshape(b * h * w, c_in)  # [BHW, C_in]
+        # LoRA path: Conv2d(1x1) is equivalent to linear transform
+        x_lora = self.dropout(x)
+        bsz, c_in, height, width = x_lora.shape
+        x_flat = x_lora.permute(0, 2, 3, 1).reshape(bsz * height * width, c_in)
 
-        # A: [r, cin], B: [cout, r]  
-        # Compute: scaling * (B @ A @ x)
         lora_mid = F.linear(x_flat, self.lora_A, None)       # [BHW, r]
         lora_out = F.linear(lora_mid, self.lora_B, None)     # [BHW, cout]
-        lora_out = lora_out.reshape(b, self.out_channels, h, w)
+        lora_out = lora_out.reshape(bsz, height, width, self.out_channels).permute(0, 3, 1, 2)
 
         return result + self.scaling * lora_out
 
@@ -131,6 +129,41 @@ class LoRALinear(nn.Module):
     @property
     def in_features(self):
         return self.linear.in_features
+
+
+# ============================================================
+# Helper: Safe Factor Setter
+# ============================================================
+
+def _set_lora_pair_(module: LoRAConv2d, B: torch.Tensor, A: torch.Tensor) -> None:
+    """Safely set one LoRA pair on a LoRAConv2d module and sync rank/scaling."""
+    if not isinstance(module, LoRAConv2d):
+        raise TypeError(f"Expected LoRAConv2d, got {type(module)}")
+    if B.ndim != 2 or A.ndim != 2:
+        raise ValueError(f"LoRA factors must be 2D, got B={tuple(B.shape)}, A={tuple(A.shape)}")
+    if B.shape[1] != A.shape[0]:
+        raise ValueError(f"Rank mismatch: B={tuple(B.shape)}, A={tuple(A.shape)}")
+    if B.shape[0] != module.out_channels:
+        raise ValueError(f"B out dim mismatch: expected {module.out_channels}, got {B.shape[0]}")
+    if A.shape[1] != module.in_channels:
+        raise ValueError(f"A in dim mismatch: expected {module.in_channels}, got {A.shape[1]}")
+
+    device = next(module.parameters()).device
+    dtype = module.lora_A.dtype
+    B = B.detach().to(device=device, dtype=dtype).clone()
+    A = A.detach().to(device=device, dtype=dtype).clone()
+    rank = int(B.shape[1])
+
+    if tuple(module.lora_B.shape) != tuple(B.shape):
+        module.lora_B = nn.Parameter(torch.empty_like(B), requires_grad=True)
+    if tuple(module.lora_A.shape) != tuple(A.shape):
+        module.lora_A = nn.Parameter(torch.empty_like(A), requires_grad=True)
+
+    module.lora_B.data.copy_(B)
+    module.lora_A.data.copy_(A)
+
+    module.rank = rank
+    module.scaling = module.alpha / rank if rank > 0 else 0.0
 
 
 # ============================================================
@@ -207,23 +240,35 @@ class LoRAInjectedAttention(nn.Module):
         from einops import rearrange
         from torch import einsum
 
-        b, c, h, w = x.shape
+        bsz, channels, height, width = x.shape
+
         q = self.lora_q(x)
         k = self.lora_k(x)
         v = self.lora_v(x)
 
         q, k, v = map(
-            lambda t: rearrange(t, "b (h c) x y -> b h c (x y)", h=self.heads),
-            (q, k, v)
+            lambda t: rearrange(
+                t,
+                "b (heads dim) height width -> b heads dim (height width)",
+                heads=self.heads,
+            ),
+            (q, k, v),
         )
-        q = q * self.scale
 
+        q = q * self.scale
         sim = einsum("b h d i, b h d j -> b h i j", q, k)
         sim = sim - sim.amax(dim=-1, keepdim=True).detach()
         attn = sim.softmax(dim=-1)
 
+        # Output is [b, heads, dim, tokens]
         out = einsum("b h i j, b h d j -> b h d i", attn, v)
-        out = rearrange(out, "b h (x y) d -> b (h d) x y", x=h, y=w)
+
+        out = rearrange(
+            out,
+            "b heads dim (height width) -> b (heads dim) height width",
+            height=height,
+            width=width,
+        )
         return self.to_out(out)
 
     def get_lora_factors(self) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
@@ -236,36 +281,31 @@ class LoRAInjectedAttention(nn.Module):
         B_dict, A_dict = {}, {}
 
         if hasattr(self, 'lora_q') and isinstance(self.lora_q, LoRAConv2d):
-            B_dict['q'] = self.lora_q.lora_B.data  # [hidden, r]
-            A_dict['q'] = self.lora_q.lora_A.data  # [r, dim]
+            B_dict['q'] = self.lora_q.lora_B.detach().cpu().clone()
+            A_dict['q'] = self.lora_q.lora_A.detach().cpu().clone()
         if hasattr(self, 'lora_k') and isinstance(self.lora_k, LoRAConv2d):
-            B_dict['k'] = self.lora_k.lora_B.data
-            A_dict['k'] = self.lora_k.lora_A.data
+            B_dict['k'] = self.lora_k.lora_B.detach().cpu().clone()
+            A_dict['k'] = self.lora_k.lora_A.detach().cpu().clone()
         if hasattr(self, 'lora_v') and isinstance(self.lora_v, LoRAConv2d):
-            B_dict['v'] = self.lora_v.lora_B.data
-            A_dict['v'] = self.lora_v.lora_A.data
+            B_dict['v'] = self.lora_v.lora_B.detach().cpu().clone()
+            A_dict['v'] = self.lora_v.lora_A.detach().cpu().clone()
         if hasattr(self, 'lora_out_conv') and isinstance(self.lora_out_conv, LoRAConv2d):
-            B_dict['out'] = self.lora_out_conv.lora_B.data
-            A_dict['out'] = self.lora_out_conv.lora_A.data
+            B_dict['out'] = self.lora_out_conv.lora_B.detach().cpu().clone()
+            A_dict['out'] = self.lora_out_conv.lora_A.detach().cpu().clone()
 
         return B_dict, A_dict
 
     def set_lora_factors(self, B_dict: Dict[str, torch.Tensor],
                          A_dict: Dict[str, torch.Tensor]):
         """Set LoRA factors from server distribution."""
-        device = next(self.parameters()).device
         if 'q' in B_dict and hasattr(self, 'lora_q') and isinstance(self.lora_q, LoRAConv2d):
-            self.lora_q.lora_B.data = B_dict['q'].to(device)
-            self.lora_q.lora_A.data = A_dict['q'].to(device)
+            _set_lora_pair_(self.lora_q, B_dict['q'], A_dict['q'])
         if 'k' in B_dict and hasattr(self, 'lora_k') and isinstance(self.lora_k, LoRAConv2d):
-            self.lora_k.lora_B.data = B_dict['k'].to(device)
-            self.lora_k.lora_A.data = A_dict['k'].to(device)
+            _set_lora_pair_(self.lora_k, B_dict['k'], A_dict['k'])
         if 'v' in B_dict and hasattr(self, 'lora_v') and isinstance(self.lora_v, LoRAConv2d):
-            self.lora_v.lora_B.data = B_dict['v'].to(device)
-            self.lora_v.lora_A.data = A_dict['v'].to(device)
+            _set_lora_pair_(self.lora_v, B_dict['v'], A_dict['v'])
         if 'out' in B_dict and hasattr(self, 'lora_out_conv') and isinstance(self.lora_out_conv, LoRAConv2d):
-            self.lora_out_conv.lora_B.data = B_dict['out'].to(device)
-            self.lora_out_conv.lora_A.data = A_dict['out'].to(device)
+            _set_lora_pair_(self.lora_out_conv, B_dict['out'], A_dict['out'])
 
 
 # Same treatment for LinearAttention
@@ -348,29 +388,27 @@ class LoRAInjectedLinearAttention(nn.Module):
     def get_lora_factors(self) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         B_dict, A_dict = {}, {}
         if hasattr(self, 'lora_q') and isinstance(self.lora_q, LoRAConv2d):
-            B_dict['q'] = self.lora_q.lora_B.data
-            A_dict['q'] = self.lora_q.lora_A.data
+            B_dict['q'] = self.lora_q.lora_B.detach().cpu().clone()
+            A_dict['q'] = self.lora_q.lora_A.detach().cpu().clone()
         if hasattr(self, 'lora_k') and isinstance(self.lora_k, LoRAConv2d):
-            B_dict['k'] = self.lora_k.lora_B.data
-            A_dict['k'] = self.lora_k.lora_A.data
+            B_dict['k'] = self.lora_k.lora_B.detach().cpu().clone()
+            A_dict['k'] = self.lora_k.lora_A.detach().cpu().clone()
         if hasattr(self, 'lora_v') and isinstance(self.lora_v, LoRAConv2d):
-            B_dict['v'] = self.lora_v.lora_B.data
-            A_dict['v'] = self.lora_v.lora_A.data
+            B_dict['v'] = self.lora_v.lora_B.detach().cpu().clone()
+            A_dict['v'] = self.lora_v.lora_A.detach().cpu().clone()
         if hasattr(self, 'lora_out_conv') and isinstance(self.lora_out_conv, LoRAConv2d):
-            B_dict['out'] = self.lora_out_conv.lora_B.data
-            A_dict['out'] = self.lora_out_conv.lora_A.data
+            B_dict['out'] = self.lora_out_conv.lora_B.detach().cpu().clone()
+            A_dict['out'] = self.lora_out_conv.lora_A.detach().cpu().clone()
         return B_dict, A_dict
 
     def set_lora_factors(self, B_dict: Dict[str, torch.Tensor],
                          A_dict: Dict[str, torch.Tensor]):
-        device = next(self.parameters()).device
         for key in ['q', 'k', 'v', 'out']:
             attr_name = f'lora_{key}' if key != 'out' else 'lora_out_conv'
             if key in B_dict and hasattr(self, attr_name):
                 lora_module = getattr(self, attr_name)
                 if isinstance(lora_module, LoRAConv2d):
-                    lora_module.lora_B.data = B_dict[key].to(device)
-                    lora_module.lora_A.data = A_dict[key].to(device)
+                    _set_lora_pair_(lora_module, B_dict[key], A_dict[key])
 
 
 # ============================================================
