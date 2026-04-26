@@ -87,6 +87,7 @@ EVAL_NUM_SAMPLES = 30000    # FedPhD 对齐评估生成样本数
 EVAL_BATCH_SIZE = 256       # FedPhD 对齐评估 batch size
 CENTRAL_AGG_INTERVAL = 5    # FedPhD central aggregation 通信统计窗口
 COMPUTE_IS = 1              # 评估时计算 Inception Score
+EVAL_REAL_SPLIT = 'train'   # FedPhD-style 使用 train split 作为真实参考
 
 # ---- DDIM 加速采样 ----
 USE_DDIM = 1                # 使用 DDIM 采样 (1=开启, 0=关闭/使用 DDPM)
@@ -229,7 +230,7 @@ PRESETS = {
         'lora_ranks': '4,8,16,4,8,16,4,8,16,4,8,16,4,8,16,4,8,16,4,8',
         'global_lora_rank': 16, 'lora_alpha_mode': 'rank',
         'use_ddim': 1, 'ddim_steps': 100, 'eval_num_samples': 1000, 'eval_batch_size': 256,
-        'central_agg_interval': 5, 'seed': 2023, 'train': 1,
+        'eval_real_split': 'train', 'central_agg_interval': 5, 'seed': 2023, 'train': 1,
     },
     'cifar10_fedphd_protocol': {
         'description': 'CIFAR10 FedPhD baseline-equivalent 协议 (R=2000, E=5)',
@@ -241,7 +242,7 @@ PRESETS = {
         'lora_ranks': '4,8,16,4,8,16,4,8,16,4,8,16,4,8,16,4,8,16,4,8',
         'global_lora_rank': 16, 'lora_alpha_mode': 'rank',
         'use_ddim': 1, 'ddim_steps': 100, 'eval_num_samples': 30000, 'eval_batch_size': 256,
-        'central_agg_interval': 5, 'seed': 2023, 'train': 1,
+        'eval_real_split': 'train', 'central_agg_interval': 5, 'seed': 2023, 'train': 1,
     },
     'infer_celeba': {
         'description': 'CelebA 推理: 生成图片 + FID评估',
@@ -326,6 +327,7 @@ def build_args_from_config():
         eval_batch_size=EVAL_BATCH_SIZE,
         central_agg_interval=CENTRAL_AGG_INTERVAL,
         compute_is=COMPUTE_IS,
+        eval_real_split=EVAL_REAL_SPLIT,
         # LoRA
         lora_rank=LORA_RANK,
         lora_ranks=LORA_RANKS,
@@ -387,6 +389,7 @@ def apply_cli_overrides(args):
     parser.add_argument('--eval_batch_size', type=int)
     parser.add_argument('--central_agg_interval', type=int)
     parser.add_argument('--compute_is', type=int)
+    parser.add_argument('--eval_real_split', type=str)
     parser.add_argument('--lora_rank', type=int)
     parser.add_argument('--lora_ranks', type=str)
     parser.add_argument('--global_lora_rank', type=int)
@@ -471,6 +474,7 @@ def print_config_summary(args):
     print(f'  Load model  :  {args.load_model or "(none)"}')
     print(f'  Sampling    :  {"DDIM (steps=" + str(args.ddim_steps) + ")" if args.use_ddim else "DDPM (steps=" + str(int(args.time_steps)) + ")"}')
     print(f'  Eval        :  samples={getattr(args, "eval_num_samples", 30000)}, batch={getattr(args, "eval_batch_size", 256)}')
+    print(f'  Real split  :  {getattr(args, "eval_real_split", "train")}')
     print(f'{"═"*56}\n')
 
 

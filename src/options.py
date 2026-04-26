@@ -66,6 +66,8 @@ def args_parser():
                         help='central aggregation interval for FedPhD-style communication reporting')
     parser.add_argument('--compute_is', type=int, default=1,
                         help='whether to compute Inception Score')
+    parser.add_argument('--eval_real_split', type=str, default='train', choices=['train', 'test'],
+                        help='which real split to export for FID/IS reference')
     
     # DDIM acceleration
     parser.add_argument('--use_ddim', type=int, default=1, help="use DDIM sampler (1) or DDPM (0)")

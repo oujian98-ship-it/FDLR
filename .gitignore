@@ -129,6 +129,8 @@ ENV/
 [Ss]cripts
 ![Ss]cripts/
 ![Ss]cripts/measure_efficiency.py
+![Ss]cripts/measure_fdrl_efficiency.py
+![Ss]cripts/check_saved_image_range.py
 pyvenv.cfg
 .venv
 pip-selfcheck.json

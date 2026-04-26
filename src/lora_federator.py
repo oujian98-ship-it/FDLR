@@ -26,6 +26,7 @@ Usage:
 
 import copy
 import csv
+import json
 import os
 import random
 import sys
@@ -48,6 +49,7 @@ if SRC_DIR not in sys.path:
 
 from diffuser import Diffuser
 from hetero_aggregation import HeteroLoRAAggregator, prefix_slice_distribution
+from hetero_aggregation import count_client_distribution_bytes, count_factor_list_bytes
 from lora import (
     inject_lora_into_unet,
     extract_all_lora_factors,
@@ -141,6 +143,64 @@ def factors_list_to_nested_dict(factors):
     return B_nested, A_nested
 
 
+def _pad_factor_to_rank(B: torch.Tensor, A: torch.Tensor, target_rank: int):
+    r = B.shape[1]
+    if r == target_rank:
+        return B, A
+    if r > target_rank:
+        raise ValueError(f'Cannot pad rank {r} down to target_rank={target_rank}')
+    B_pad = torch.zeros(B.shape[0], target_rank, dtype=B.dtype, device=B.device)
+    A_pad = torch.zeros(target_rank, A.shape[1], dtype=A.dtype, device=A.device)
+    B_pad[:, :r] = B
+    A_pad[:r, :] = A
+    return B_pad, A_pad
+
+
+def average_lora_factors_to_global(client_factors_list, data_sizes, target_rank, pad_to_rank):
+    """
+    Direct factor-space averaging baseline.
+
+    Use pad_to_rank=False for homogeneous FedAvg-LoRA and pad_to_rank=True for
+    heterogeneous naive factor averaging.
+    """
+    total = sum(data_sizes[cid] for cid, _ in client_factors_list)
+    if total <= 0:
+        raise ValueError('Cannot average LoRA factors with zero total data size.')
+
+    B_global = {}
+    A_global = {}
+    expected_shapes = {}
+
+    for cid, factors in client_factors_list:
+        weight = data_sizes[cid] / total
+        for layer_name, B_dict, A_dict in factors:
+            if layer_name not in B_global:
+                B_global[layer_name] = {}
+                A_global[layer_name] = {}
+            for key in B_dict:
+                B = B_dict[key]
+                A = A_dict[key]
+                if pad_to_rank:
+                    B, A = _pad_factor_to_rank(B, A, target_rank)
+                else:
+                    shape_key = (layer_name, key)
+                    shape = (tuple(B.shape), tuple(A.shape))
+                    if shape_key in expected_shapes and expected_shapes[shape_key] != shape:
+                        raise ValueError(
+                            'fedavg_lora requires homogeneous factor shapes. '
+                            f'Layer {layer_name}/{key} got {shape}, expected {expected_shapes[shape_key]}.'
+                        )
+                    expected_shapes[shape_key] = shape
+
+                if key not in B_global[layer_name]:
+                    B_global[layer_name][key] = torch.zeros_like(B)
+                    A_global[layer_name][key] = torch.zeros_like(A)
+                B_global[layer_name][key] += weight * B
+                A_global[layer_name][key] += weight * A
+
+    return B_global, A_global
+
+
 def build_base_model(args, device: str):
     """
     Build and optionally load the base U-Net model (WITHOUT LoRA injection).
@@ -212,6 +272,50 @@ def save_lora_metadata(path: Path, model, args, client_rank_map, comm_stats, rou
         'experiment_args': vars(args) if hasattr(args, '__dict__') else {},
     }, path)
     print(f'Saved LoRA metadata: {path}')
+
+
+def save_experiment_protocol(result_folder: Path, args, data_stats, num_params, lora_params):
+    protocol = {
+        "protocol_name": "FedPhD-protocol-aligned FDLR",
+        "dataset": args.dataset,
+        "partition": getattr(args, "partition", ""),
+        "num_users": args.num_users,
+        "frac": args.frac,
+        "rounds": args.rounds,
+        "local_ep": args.local_ep,
+        "local_bs": args.local_bs,
+        "image_size": args.image_size,
+        "model_dim": getattr(args, "model_dim", None),
+        "dim_mults": getattr(args, "dim_mults", None),
+        "num_channels": args.num_channels,
+        "conditional": args.conditional,
+        "time_steps": args.time_steps,
+        "use_ddim": getattr(args, "use_ddim", 1),
+        "ddim_steps": getattr(args, "ddim_steps", 100),
+        "eval_num_samples": getattr(args, "eval_num_samples", 30000),
+        "eval_batch_size": getattr(args, "eval_batch_size", 256),
+        "compute_is": getattr(args, "compute_is", 1),
+        "eval_real_split": getattr(args, "eval_real_split", "train"),
+        "lora_ranks": getattr(args, "lora_ranks", ""),
+        "global_lora_rank": getattr(args, "global_lora_rank", None),
+        "lora_alpha_mode": getattr(args, "lora_alpha_mode", "rank"),
+        "rank_beta": getattr(args, "rank_beta", 0.5),
+        "rank_correction": getattr(args, "rank_correction", 1),
+        "use_procrustes": getattr(args, "use_procrustes", 1),
+        "use_prefix_init": getattr(args, "use_prefix_init", 1),
+        "agg_mode": getattr(args, "agg_mode", "fdlr"),
+        "seed": getattr(args, "seed", 2023),
+        "total_params": int(num_params),
+        "trainable_params": int(lora_params),
+        "data_stats": {
+            str(k): {str(kk): int(vv) for kk, vv in val.items()}
+            for k, val in data_stats.items()
+        },
+    }
+    path = result_folder / "fedphd_protocol_config.json"
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(protocol, f, indent=2, ensure_ascii=False)
+    print(f"Saved FedPhD protocol config: {path}")
 
 
 def run_training(args):
@@ -317,11 +421,6 @@ def run_training(args):
 
     # ---- Create aggregator ----
     agg_mode = getattr(args, 'agg_mode', 'fdlr')
-    if agg_mode in ('factor_avg', 'fedavg_lora'):
-        raise NotImplementedError(
-            f'agg_mode={agg_mode} is not implemented yet. '
-            f'Use agg_mode=fdlr or agg_mode=update_space for the current FedPhD-aligned protocol.'
-        )
     use_procrustes = bool(getattr(args, 'use_procrustes', 1))
     if agg_mode == 'update_space':
         use_procrustes = False
@@ -359,6 +458,7 @@ def run_training(args):
     result_folder = parent_path / f'results/{time.strftime("%Y%m%d-%H%M%S")}_{model_name}'
     os.makedirs(result_folder, exist_ok=True)
     os.makedirs(parent_path / 'models', exist_ok=True)
+    save_experiment_protocol(result_folder, args, data_stats, num_params, lora_params)
 
     # ---- Training rounds ----
     train_losses = []
@@ -366,6 +466,7 @@ def run_training(args):
 
     # Create clients (lazy creation on first use, then cached)
     client_cache = {}
+    agg_round_num = 0
 
     for round_idx in tqdm(range(args.rounds), desc='Federated Rounds'):
         print(f'\n{"="*60}')
@@ -424,11 +525,33 @@ def run_training(args):
 
         # ---- Server-side aggregation ----
         agg_t0 = time.time()
-        agg_result = aggregator.aggregate_round(
-            client_factors_list=local_factors_list,
-            data_sizes=data_sizes,
-            client_ranks=active_ranks,
-        )
+        if agg_mode in ('fedavg_lora', 'factor_avg'):
+            B_global, A_global = average_lora_factors_to_global(
+                local_factors_list,
+                data_sizes=data_sizes,
+                target_rank=global_rank,
+                pad_to_rank=(agg_mode == 'factor_avg'),
+            )
+            client_updates = prefix_slice_distribution(B_global, A_global, client_rank_map)
+            agg_result = {
+                'global_B': B_global,
+                'global_A': A_global,
+                'client_updates': client_updates,
+                'stats': {
+                    'round': agg_round_num,
+                    'num_clients': len(local_factors_list),
+                    'agg_mode': agg_mode,
+                    'upload_bytes': sum(count_factor_list_bytes(factors) for _, factors in local_factors_list),
+                    'download_bytes': count_client_distribution_bytes(client_updates),
+                },
+            }
+            agg_round_num += 1
+        else:
+            agg_result = aggregator.aggregate_round(
+                client_factors_list=local_factors_list,
+                data_sizes=data_sizes,
+                client_ranks=active_ranks,
+            )
         agg_time = time.time() - agg_t0
         round_wall = time.time() - start_time
         agg_result['stats']['server_aggregation_time_sec'] = float(agg_time)
@@ -634,14 +757,17 @@ def run_inference(args):
 
     # ---- Export dataset samples (for FID reference) ----
     if args.export_dataset > 0:
-        real_dir = parent_path / f'exports/{args.dataset}/dataset'
-        export_dataset(real_dir, args.dataset, args.export_dataset, train=False)
-        print(f'Exported {args.export_dataset} real dataset samples to {real_dir}')
+        real_split = getattr(args, 'eval_real_split', 'train')
+        real_train = real_split == 'train'
+        real_dir = parent_path / f'exports/{args.dataset}/dataset_{real_split}'
+        export_dataset(real_dir, args.dataset, args.export_dataset, train=real_train)
+        print(f'Exported {args.export_dataset} real {real_split} samples to {real_dir}')
 
     # ---- Auto FID evaluation (when both real and fake exist) ----
     if args.export_samples > 0 and args.export_dataset > 0:
         fake_dir = parent_path / f'exports/{model_name}'
-        real_dir = parent_path / f'exports/{args.dataset}/dataset'
+        real_split = getattr(args, 'eval_real_split', 'train')
+        real_dir = parent_path / f'exports/{args.dataset}/dataset_{real_split}'
         print(f'\n{"="*50}')
         print(f'Computing FID, IS & Precision/Recall...')
         print(f'  Real (reference): {real_dir}')
@@ -758,6 +884,9 @@ def main(external_args=None):
                    help='For FedPhD-style communication reporting. Default 5.')
     p.add_argument('--compute_is', type=int, default=1,
                    help='Whether to compute Inception Score during evaluation.')
+    p.add_argument('--eval_real_split', type=str, default='train',
+                   choices=['train', 'test'],
+                   help='Which real split to export for FID/IS reference. FedPhD-style uses train.')
 
     # Add LoRA-specific args
     add_lora_arguments(p)

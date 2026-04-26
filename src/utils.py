@@ -157,6 +157,20 @@ def transform_cifar10_eval(image):
     return transform(image.convert("RGB"))
 
 
+def save_image_01(tensor, path):
+    """
+    Save image tensor safely for FID/IS evaluation.
+
+    Training data and diffusion samples may be in [-1, 1].
+    FID/IS image files should be saved in [0, 1].
+    """
+    x = tensor.detach().cpu()
+    if x.min() < 0:
+        x = (x + 1.0) / 2.0
+    x = x.clamp(0.0, 1.0)
+    torchvision.utils.save_image(x, path)
+
+
 def transform_celeba(image):
     transform = transforms.Compose(
         [transforms.CenterCrop(178),  # crop the center region of the image
@@ -191,7 +205,7 @@ def export_dataset(folder, dataset_name, num_images=sys.maxsize, train=True, off
         image, label = dataset[i]
         image_name = f'image_{offset + i}.png'
         image_path = os.path.join(folder, image_name)
-        torchvision.utils.save_image(image, image_path)
+        save_image_01(image, image_path)
 
 
 class CustomCelebA(Dataset):
@@ -419,6 +433,28 @@ def partition_celeba_fedphd_one_class(dataset, num_users, seed=2023):
     return net_dataidx_map
 
 
+def assert_fedphd_cifar2_split(y_train, net_dataidx_map):
+    for cid, idxs in net_dataidx_map.items():
+        labels = np.unique(y_train[idxs])
+        if len(labels) != 2:
+            raise RuntimeError(
+                f"FedPhD CIFAR2 split failed: client {cid} has labels {labels}, "
+                f"expected exactly 2 classes."
+            )
+    print("[OK] FedPhD CIFAR2 split verified: each client has exactly 2 classes.")
+
+
+def assert_fedphd_celeba4_split(y_train, net_dataidx_map):
+    for cid, idxs in net_dataidx_map.items():
+        labels = np.unique(y_train[idxs])
+        if len(labels) != 1:
+            raise RuntimeError(
+                f"FedPhD CelebA4 split failed: client {cid} has labels {labels}, "
+                f"expected exactly 1 class."
+            )
+    print("[OK] FedPhD CelebA4 split verified: each client has exactly 1 class.")
+
+
 # https://github.com/Xtra-Computing/NIID-Bench/blob/5371adbff98156793a413c7658923673b4aef7d7/utils.py#L40
 def get_partitioned_dataset(args, seed=2023, beta=0.5):
     seed = int(getattr(args, 'seed', seed))
@@ -437,6 +473,7 @@ def get_partitioned_dataset(args, seed=2023, beta=0.5):
             num_users=args.num_users,
             seed=seed,
         )
+        assert_fedphd_cifar2_split(y_train, net_dataidx_map)
         traindata_cls_counts = record_net_data_stats(y_train, net_dataidx_map)
         return dataset, net_dataidx_map, traindata_cls_counts
 
@@ -446,6 +483,7 @@ def get_partitioned_dataset(args, seed=2023, beta=0.5):
             num_users=args.num_users,
             seed=seed,
         )
+        assert_fedphd_celeba4_split(y_train, net_dataidx_map)
         traindata_cls_counts = record_net_data_stats(y_train, net_dataidx_map)
         return dataset, net_dataidx_map, traindata_cls_counts
 
@@ -583,7 +621,7 @@ def export_samples(diffuser, folder, conditional, model, time_steps, image_size,
             image_name = f'image_{img_num}_label{labels[label_offset + i]}.png' if conditional else f'image{img_num}.png'
             img_num += 1
             image_path = os.path.join(folder, image_name)
-            torchvision.utils.save_image(images[-1][i], image_path)
+            save_image_01(images[-1][i], image_path)
         if conditional:
             label_offset += cur_batch_size
         num_to_go -= cur_batch_size
