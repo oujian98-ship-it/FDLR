@@ -38,6 +38,7 @@ python main.py --method <方法> --dataset <数据集> [其他参数...]
 | 数据集 | 图像尺寸 | 通道数 | 类别数 | 条件生成 | 预训练模型 |
 |--------|---------|--------|--------|---------|-----------|
 | **fmnist** | 28×28 | 1 (灰度) | 10 | ✅ 需要 (`conditional=1`) | `model_fmnist.pth` |
+| **cifar10** / **cifar** | 32×32 | 3 (RGB) | 10 | ✅ 需要 (`conditional=1`) | `model_cifar.pth` |
 | **celeba** | 64×64 | 3 (RGB) | 16 | ❌ 不需要 (`conditional=0`) | `model_celeba.pth` |
 
 ### 切换数据集示例
@@ -45,6 +46,9 @@ python main.py --method <方法> --dataset <数据集> [其他参数...]
 ```powershell
 # FMNIST 数据集
 python main.py --method lora --dataset fmnist
+
+# CIFAR10 数据集
+python main.py --method lora --dataset cifar10
 
 # CelebA 数据集
 python main.py --method lora --dataset celeba
@@ -55,6 +59,7 @@ python main.py --method lora --dataset celeba
 ### 自定义数据路径
 ```powershell
 python main.py --dataset fmnist --data_root "D:\data\fashion-mnist-master"
+python main.py --dataset cifar10 --data_root "D:\data\cifar-10-python"
 python main.py --dataset celeba --data_root "D:\data\CelebA"
 ```
 
@@ -131,7 +136,9 @@ python main.py --preset infer_celeba
 | `celeba_lora_quick` | CelebA LoRA 快速实验 (R=10) |
 | `celeba_lora_paper_align` | CelebA LoRA 对齐论文 (R=30, E=5) |
 | `celeba_fedavg_baseline` | CelebA FedAvg 原论文对齐 |
+| `cifar10_lora_quick` | CIFAR10 LoRA 快速实验 |
 | `infer_fmnist` | FMNIST 推理评估 |
+| `infer_cifar10` | CIFAR10 推理评估 |
 | `infer_celeba` | CelebA 推理评估 |
 
 ---
@@ -143,7 +150,7 @@ python main.py --preset infer_celeba
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `--method` | str | `lora` | 训练方法: `lora` 或 `fedavg` |
-| `--dataset` | str | `fmnist` | 数据集: `fmnist` 或 `celeba` |
+| `--dataset` | str | `fmnist` | 数据集: `fmnist`、`cifar10`/`cifar` 或 `celeba` |
 | `--train` | int | `1` | 1=训练, 0=仅推理 |
 | `--load_model` | str | `` | 加载的模型文件名 |
 
