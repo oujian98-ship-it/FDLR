@@ -26,9 +26,20 @@ def args_parser():
     parser.add_argument('--lr', type=float, default=1e-4, help='learning rate')
     parser.add_argument('--momentum', type=float, default=0.5, help='SGD momentum (default: 0.5)')
     parser.add_argument('--optimizer', type=str, default='adam', help="type of optimizer")
+    parser.add_argument('--model_dim', type=int, default=0,
+                        help='base channel dimension of U-Net; if 0, fallback to image_size')
+    parser.add_argument('--dim_mults', type=str, default='1,2,4',
+                        help='comma-separated U-Net dim multipliers')
 
     # data arguments
     parser.add_argument('--dataset', type=str, default='fmnist', help="name of dataset")
+    parser.add_argument('--data_root', type=str, default='',
+                        help='custom dataset root path, e.g. D:\\data\\cifar-10-python')
+    parser.add_argument('--download_dataset', type=int, default=0,
+                        help='whether torchvision should download the dataset')
+    parser.add_argument('--partition', type=str, default='',
+                        help='partition rule: fedphd-cifar2, fedphd-celeba4, or empty')
+    parser.add_argument('--seed', type=int, default=2023, help='random seed')
     parser.add_argument('--image_size', type=int, default=28, help="size of image")
     parser.add_argument('--num_channels', type=int, default=1, help="the number of channels in the image")
     parser.add_argument('--iid', type=int, default=1,
@@ -47,6 +58,14 @@ def args_parser():
                         help="the number of training samples to export (0 by default)")
     parser.add_argument('--show_samples', type=int, default=0, help="whether to show some test samples (1) or not (0)")
     parser.add_argument('--exp_rounds', type=int, default=0, help="whether to export intermediate samples (1) or not (0)")
+    parser.add_argument('--eval_num_samples', type=int, default=30000,
+                        help='number of generated samples for FedPhD-aligned evaluation')
+    parser.add_argument('--eval_batch_size', type=int, default=256,
+                        help='batch size for FedPhD-aligned generation/evaluation')
+    parser.add_argument('--central_agg_interval', type=int, default=5,
+                        help='central aggregation interval for FedPhD-style communication reporting')
+    parser.add_argument('--compute_is', type=int, default=1,
+                        help='whether to compute Inception Score')
     
     # DDIM acceleration
     parser.add_argument('--use_ddim', type=int, default=1, help="use DDIM sampler (1) or DDPM (0)")

@@ -24,7 +24,7 @@ models/
 !requirements.txt
 # Ensure README and experiment guides are NOT ignored
 !*.md
-
+*.md
 .DS_Store
 # Created by .ignore support plugin (hsz.mobi)
 ### Python template
@@ -127,6 +127,8 @@ ENV/
 [Ll]ib64
 [Ll]ocal
 [Ss]cripts
+![Ss]cripts/
+![Ss]cripts/measure_efficiency.py
 pyvenv.cfg
 .venv
 pip-selfcheck.json
@@ -212,3 +214,5 @@ fabric.properties
 
 # idea folder, uncomment if you don't need it
 # .idea
+FDLR_严格对齐FedPhD实验协议_代码修改方案.md
+EXPERIMENT_GUIDE.md

@@ -18,6 +18,7 @@ from torchvision import datasets, transforms
 
 from fid_score import calculate_fid
 from improved_precision_recall import calculate_precision_recall
+from metrics_inception_score import calculate_inception_score
 
 
 def create_training_config(rounds=10, num_users=5, frac=1, local_ep=3, local_bs=128, train_mode='full', train=1,
@@ -44,20 +45,28 @@ def create_precision_recall_config(path_real='', path_fake='', batch_size=50, k=
 
 
 def perform_evaluation(real_path, fake_path, dataset_to_export=None, num_samples=100,
-                       eval_log_dir=None, config_tag=''):
-    """Run FID + Precision/Recall evaluation and optionally log results."""
+                       eval_log_dir=None, config_tag='', batch_size=256,
+                       compute_is=True):
+    """Run FID + IS + Precision/Recall evaluation and optionally log results."""
     import datetime
 
     if dataset_to_export is not None:
         export_dataset(real_path, dataset_to_export, num_samples, train=False)
 
-    fid_config = create_fid_config(paths=(real_path, fake_path))
+    fid_config = create_fid_config(paths=(real_path, fake_path), batch_size=batch_size)
     precision_recall_config = create_precision_recall_config(path_real=real_path, path_fake=fake_path,
-                                                             num_samples=num_samples)
+                                                             num_samples=num_samples,
+                                                             batch_size=batch_size)
 
-    # Capture FID result
     _fid_result = calculate_fid(fid_config)
     _pr_result = calculate_precision_recall(precision_recall_config)
+    _is_result = None
+    if compute_is:
+        _is_result = calculate_inception_score(
+            image_folder=fake_path,
+            num_samples=num_samples,
+            batch_size=batch_size,
+        )
 
     # ---- Save evaluation log ----
     if eval_log_dir:
@@ -76,9 +85,17 @@ def perform_evaluation(real_path, fake_path, dataset_to_export=None, num_samples
             f.write(f'Real path   : {real_path}\n')
             f.write(f'Fake path   : {fake_path}\n')
             f.write(f'Num samples : {num_samples}\n\n')
+            f.write(f'Batch size  : {batch_size}\n\n')
             f.write(f'FID Score   : {_fid_result}\n')
+            f.write(f'IS Score    : {_is_result}\n')
             f.write(f'Precision/Recall: {_pr_result}\n')
         print(f'\n[Evaluation log saved] {log_path}')
+
+    return {
+        'fid': _fid_result,
+        'inception_score': _is_result,
+        'precision_recall': _pr_result,
+    }
 
 
 class LabeledCelebA(Dataset):
@@ -123,6 +140,21 @@ def transform_mnist(image):
         transforms.ToTensor(),
         transforms.Lambda(lambda t: (t * 2) - 1)])
     return transform(image.convert("L"))
+
+
+def transform_cifar10_train(image):
+    transform = transforms.Compose([
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Lambda(lambda t: (t * 2) - 1)])
+    return transform(image.convert("RGB"))
+
+
+def transform_cifar10_eval(image):
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Lambda(lambda t: (t * 2) - 1)])
+    return transform(image.convert("RGB"))
 
 
 def transform_celeba(image):
@@ -235,18 +267,80 @@ class CustomCelebA(Dataset):
         return image, index
 
 
+class FedPhDCelebA4(Dataset):
+    """
+    FedPhD-style CelebA labels:
+        0: young male
+        1: old male
+        2: young female
+        3: old female
+    """
+
+    classes = ['young_male', 'old_male', 'young_female', 'old_female']
+
+    def __init__(self, base_dataset):
+        self.base_dataset = base_dataset
+        self.indices = []
+        self.labels = []
+
+        male_idx = base_dataset.attr_names.index('Male')
+        young_idx = base_dataset.attr_names.index('Young')
+
+        for i in range(len(base_dataset)):
+            male = int(base_dataset.attr[i, male_idx])
+            young = int(base_dataset.attr[i, young_idx])
+
+            if male == 1 and young == 1:
+                label = 0
+            elif male == 1 and young == 0:
+                label = 1
+            elif male == 0 and young == 1:
+                label = 2
+            else:
+                label = 3
+
+            self.indices.append(i)
+            self.labels.append(label)
+
+        self.labels = np.array(self.labels, dtype=np.int64)
+
+    def __getitem__(self, index):
+        base_index = self.indices[index]
+        image, _ = self.base_dataset[base_index]
+        label = int(self.labels[index])
+        return image, label
+
+    def __len__(self):
+        return len(self.indices)
+
+    def get_labels(self):
+        return self.labels
+
+
 def get_dataset_from_name(name, train=True, labeled=True):
+    name = name.lower()
     if name == 'fmnist':
         data_dir = str(Path(__file__).parent.parent / 'data/fmnist/')
         return datasets.FashionMNIST(data_dir, train=train, download=True, transform=transform_mnist)
+    elif name in ('cifar', 'cifar10'):
+        data_root = globals().get('_CUSTOM_DATA_ROOT',
+                                  str(Path(__file__).parent.parent / 'data/cifar10/'))
+        download = bool(globals().get('_DOWNLOAD_DATASET', False))
+        transform = transform_cifar10_train if train else transform_cifar10_eval
+        return datasets.CIFAR10(data_root, train=train, download=download, transform=transform)
     elif name == 'celeba':
         # Use custom data root if provided (set by lora_federator.py --data_root)
         data_root = globals().get('_CUSTOM_DATA_ROOT',
                                     str(Path(__file__).parent.parent / 'data/celeba/'))
         dataset = CustomCelebA(data_root, split="train" if train else "test", transform=transform_celeba)
-        if labeled:
+        partition = globals().get('_PARTITION_RULE', '')
+        if partition == 'fedphd-celeba4':
+            dataset = FedPhDCelebA4(dataset)
+        elif labeled:
             dataset = LabeledCelebA(dataset)
         return dataset
+    else:
+        raise ValueError(f"Unknown dataset: {name}")
 
 
 def create_celeb_hq():
@@ -256,18 +350,110 @@ def create_celeb_hq():
     )
 
 
+def partition_cifar10_fedphd_two_classes(dataset, num_users, seed=2023):
+    """FedPhD-style CIFAR10 split: each client owns exactly two classes."""
+    rng = np.random.default_rng(seed)
+    y_train = np.array(dataset.targets)
+
+    if num_users < 5:
+        raise ValueError('fedphd-cifar2 requires num_users >= 5 so all CIFAR10 classes are assigned.')
+
+    if num_users % 5 != 0:
+        print(
+            f"[Warning] FedPhD CIFAR2 split is cleanest when num_users is a multiple of 5. "
+            f"Got num_users={num_users}."
+        )
+
+    base_pairs = [
+        [0, 5],
+        [1, 6],
+        [2, 7],
+        [3, 8],
+        [4, 9],
+    ]
+    client_classes = {cid: base_pairs[cid % len(base_pairs)] for cid in range(num_users)}
+    class_to_clients = {k: [] for k in range(10)}
+    for cid, cls_list in client_classes.items():
+        for c in cls_list:
+            class_to_clients[c].append(cid)
+
+    net_dataidx_map = {cid: [] for cid in range(num_users)}
+    for c in range(10):
+        idx_c = np.where(y_train == c)[0]
+        rng.shuffle(idx_c)
+        clients_for_c = class_to_clients[c]
+        splits = np.array_split(idx_c, len(clients_for_c))
+        for cid, split in zip(clients_for_c, splits):
+            net_dataidx_map[cid].extend(split.tolist())
+
+    for cid in net_dataidx_map:
+        rng.shuffle(net_dataidx_map[cid])
+        net_dataidx_map[cid] = np.array(net_dataidx_map[cid], dtype=np.int64)
+
+    return net_dataidx_map
+
+
+def partition_celeba_fedphd_one_class(dataset, num_users, seed=2023):
+    """FedPhD-style CelebA split: each client owns exactly one of four labels."""
+    rng = np.random.default_rng(seed)
+    y_train = dataset.get_labels()
+    if num_users < 4:
+        raise ValueError('fedphd-celeba4 requires num_users >= 4 so all CelebA4 labels are assigned.')
+    class_to_clients = {k: [] for k in range(4)}
+    for cid in range(num_users):
+        class_to_clients[cid % 4].append(cid)
+
+    net_dataidx_map = {cid: [] for cid in range(num_users)}
+    for c in range(4):
+        idx_c = np.where(y_train == c)[0]
+        rng.shuffle(idx_c)
+        clients_for_c = class_to_clients[c]
+        splits = np.array_split(idx_c, len(clients_for_c))
+        for cid, split in zip(clients_for_c, splits):
+            net_dataidx_map[cid].extend(split.tolist())
+
+    for cid in net_dataidx_map:
+        rng.shuffle(net_dataidx_map[cid])
+        net_dataidx_map[cid] = np.array(net_dataidx_map[cid], dtype=np.int64)
+
+    return net_dataidx_map
+
+
 # https://github.com/Xtra-Computing/NIID-Bench/blob/5371adbff98156793a413c7658923673b4aef7d7/utils.py#L40
 def get_partitioned_dataset(args, seed=2023, beta=0.5):
+    seed = int(getattr(args, 'seed', seed))
+    partition = getattr(args, 'partition', '')
+    globals()['_PARTITION_RULE'] = partition
     dataset = get_dataset_from_name(args.dataset)
+
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    dataset_name = args.dataset.lower()
+    y_train = np.array(dataset.targets) if dataset_name in ("fmnist", "cifar", "cifar10") else dataset.get_labels()
+
+    if dataset_name in ('cifar', 'cifar10') and partition == 'fedphd-cifar2':
+        net_dataidx_map = partition_cifar10_fedphd_two_classes(
+            dataset,
+            num_users=args.num_users,
+            seed=seed,
+        )
+        traindata_cls_counts = record_net_data_stats(y_train, net_dataidx_map)
+        return dataset, net_dataidx_map, traindata_cls_counts
+
+    if dataset_name == 'celeba' and partition == 'fedphd-celeba4':
+        net_dataidx_map = partition_celeba_fedphd_one_class(
+            dataset,
+            num_users=args.num_users,
+            seed=seed,
+        )
+        traindata_cls_counts = record_net_data_stats(y_train, net_dataidx_map)
+        return dataset, net_dataidx_map, traindata_cls_counts
+
     distribution = "noniid-label"
     if args.iid and args.unequal:
         distribution = "iid-quantity"
     elif args.iid:
         distribution = "iid-homo"
-
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    y_train = np.array(dataset.targets) if args.dataset != "celeba" else dataset.get_labels()
 
     if distribution == "iid-homo":
         idxs = np.random.permutation(len(dataset))
@@ -368,7 +554,7 @@ def load_pickle_stats(filename):
 
 
 def export_samples(diffuser, folder, conditional, model, time_steps, image_size, channels, num_classes=10,
-                   num_images=1000, use_ddim=False, ddim_steps=100):
+                   num_images=1000, use_ddim=False, ddim_steps=100, batch_size=256):
     if not os.path.exists(folder):
         os.makedirs(folder)
 
@@ -383,23 +569,24 @@ def export_samples(diffuser, folder, conditional, model, time_steps, image_size,
     label_offset = 0  # track label position across batches
 
     while num_to_go > 0:
-        batch_size = min(500, num_to_go)
+        cur_batch_size = min(batch_size, num_to_go)
         # FIX: pass labels to sampler when conditional generation is used
         sample_labels = None
         if conditional and labels:
             _device = next(model.parameters()).device
-            sample_labels = torch.tensor(labels[label_offset:label_offset + batch_size], device=_device)
-            label_offset += batch_size
+            sample_labels = torch.tensor(labels[label_offset:label_offset + cur_batch_size], device=_device)
 
-        images = diffuser.sample(model, time_steps, image_size=image_size, batch_size=batch_size,
+        images = diffuser.sample(model, time_steps, image_size=image_size, batch_size=cur_batch_size,
                                   channels=channels, labels=sample_labels,
                                   use_ddim=use_ddim, ddim_steps=ddim_steps)
         for i in range(len(images[-1])):
-            image_name = f'image_{img_num}_label{labels[i]}.png' if conditional else f'image{img_num}.png'
+            image_name = f'image_{img_num}_label{labels[label_offset + i]}.png' if conditional else f'image{img_num}.png'
             img_num += 1
             image_path = os.path.join(folder, image_name)
             torchvision.utils.save_image(images[-1][i], image_path)
-        num_to_go -= batch_size
+        if conditional:
+            label_offset += cur_batch_size
+        num_to_go -= cur_batch_size
 
 
 def show_samples(diffuser, conditional, model, dataset, time_steps, image_size, channels,

@@ -49,6 +49,12 @@ from utils import exp_details, DecoderTrainingTask, is_up_parameter, \
     export_samples, show_samples
 
 
+def parse_dim_mults(dim_mults_str: str):
+    if not dim_mults_str:
+        return (1, 2, 4)
+    return tuple(int(x.strip()) for x in dim_mults_str.split(',') if x.strip())
+
+
 def create_training_tasks(num_clients, train_mode):
     tasks = None
     if train_mode == 'full':
@@ -95,10 +101,13 @@ def main(args):
 
     # ---- Set custom data root if provided ----
     data_root = getattr(args, 'data_root', '')
+    download_dataset = bool(getattr(args, 'download_dataset', 0))
+    import utils as _utils
     if data_root:
-        import utils as _utils
         _utils._CUSTOM_DATA_ROOT = data_root
         print(f'Using custom data root: {data_root}')
+    _utils._DOWNLOAD_DATASET = download_dataset
+    _utils._PARTITION_RULE = getattr(args, 'partition', '')
 
     # load dataset and user groups
     train_dataset, client_groups, data_stats = get_partitioned_dataset(args)
@@ -110,6 +119,10 @@ def main(args):
     image_size = args.image_size
     is_conditional = args.conditional == 1
     channels = args.num_channels
+    model_dim = int(getattr(args, 'model_dim', image_size))
+    if model_dim <= 0:
+        model_dim = image_size
+    dim_mults = parse_dim_mults(getattr(args, 'dim_mults', '1,2,4'))
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f'Using device: {device}')
@@ -133,15 +146,16 @@ def main(args):
 
     # Build model structure first (always needed for training)
     global_model = UnetConditional(
-        dim=image_size,
+        dim=model_dim,
         channels=channels,
-        dim_mults=(1, 2, 4,),
-        num_classes=len(train_dataset.classes),
+        dim_mults=dim_mults,
+        num_classes=args.num_classes,
     ) if is_conditional else Unet(
-        dim=image_size,
+        dim=model_dim,
         channels=channels,
-        dim_mults=(1, 2, 4,),
+        dim_mults=dim_mults,
     )
+    print(f'[Model] image_size={image_size}, model_dim={model_dim}, dim_mults={dim_mults}, conditional={is_conditional}')
     global_model.to(device)
 
     if found_existing_model:
@@ -292,7 +306,8 @@ def main(args):
                                    is_conditional, global_model, args.time_steps, image_size, channels,
                                    args.num_classes, args.exp_rounds,
                                    use_ddim=bool(getattr(args, 'use_ddim', 1)),
-                                   ddim_steps=getattr(args, 'ddim_steps', 100))
+                                   ddim_steps=getattr(args, 'ddim_steps', 100),
+                                   batch_size=getattr(args, 'eval_batch_size', 256))
 
         # Export the averaged loss data and number of parameter updates shared
         file_name = result_folder / f'{model_name}.csv'
@@ -333,9 +348,10 @@ def main(args):
     if args.export_samples > 0:
         export_samples(diffuser, parent_path / f'exports/{model_name}', is_conditional, global_model,
                        args.time_steps,
-                       image_size, channels, args.num_classes, args.export_samples,
-                       use_ddim=bool(getattr(args, 'use_ddim', 1)),
-                       ddim_steps=getattr(args, 'ddim_steps', 100))
+                      image_size, channels, args.num_classes, args.export_samples,
+                      use_ddim=bool(getattr(args, 'use_ddim', 1)),
+                      ddim_steps=getattr(args, 'ddim_steps', 100),
+                      batch_size=getattr(args, 'eval_batch_size', 256))
     if args.show_samples:
         show_samples(diffuser, is_conditional, global_model, train_dataset, args.time_steps, image_size,
                      channels, use_ddim=bool(getattr(args, 'use_ddim', 1)),

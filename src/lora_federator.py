@@ -110,6 +110,24 @@ def parse_lora_ranks(rank_str: str, num_clients: int, default_rank: int = 8) -> 
         return {i: int(rank_str.strip()) for i in range(num_clients)}
 
 
+def parse_dim_mults(dim_mults_str: str):
+    if not dim_mults_str:
+        return (1, 2, 4)
+    return tuple(int(x.strip()) for x in dim_mults_str.split(',') if x.strip())
+
+
+def resolve_lora_alpha(args, rank: int) -> float:
+    """
+    Default alpha=rank so LoRA scaling is 1 and the effective update is B @ A.
+    """
+    mode = getattr(args, 'lora_alpha_mode', 'rank')
+    if mode == 'rank':
+        return float(rank)
+    if mode == 'fixed':
+        return float(getattr(args, 'lora_alpha', 1.0))
+    raise ValueError(f'Unsupported lora_alpha_mode={mode}')
+
+
 def factors_list_to_nested_dict(factors):
     """
     Convert [(layer_name, B_dict, A_dict), ...] to
@@ -131,19 +149,24 @@ def build_base_model(args, device: str):
     is_conditional = args.conditional == 1
     channels = args.num_channels
     image_size = args.image_size
+    model_dim = int(getattr(args, 'model_dim', image_size))
+    if model_dim <= 0:
+        model_dim = image_size
+    dim_mults = parse_dim_mults(getattr(args, 'dim_mults', '1,2,4'))
 
     model = (
         UnetConditional(
-            dim=image_size,
+            dim=model_dim,
             channels=channels,
-            dim_mults=(1, 2, 4,),
+            dim_mults=dim_mults,
             num_classes=args.num_classes,
         ) if is_conditional else Unet(
-            dim=image_size,
+            dim=model_dim,
             channels=channels,
-            dim_mults=(1, 2, 4,),
+            dim_mults=dim_mults,
         )
     )
+    print(f'[Model] image_size={image_size}, model_dim={model_dim}, dim_mults={dim_mults}, conditional={is_conditional}')
 
     # Load pre-trained weights if specified
     parent_path = Path(__file__).parent.parent
@@ -198,15 +221,25 @@ def run_training(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f'Using device: {device}')
 
+    seed = int(getattr(args, 'seed', 2023))
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
     exp_details(args)
 
     # ---- Set custom data root if provided ----
     data_root = getattr(args, 'data_root', '')
+    download_dataset = bool(getattr(args, 'download_dataset', 0))
+    import utils as _utils
     if data_root:
         # Override CelebA data path via module-level patch
-        import utils as _utils
         _utils._CUSTOM_DATA_ROOT = data_root
         print(f'Using custom data root: {data_root}')
+    _utils._DOWNLOAD_DATASET = download_dataset
+    _utils._PARTITION_RULE = getattr(args, 'partition', '')
 
     # ---- Load dataset & partition ----
     train_dataset, client_groups, data_stats = get_partitioned_dataset(args)
@@ -246,11 +279,12 @@ def run_training(args):
 
     # ---- Server model: global-rank LoRA model for aggregation/checkpoint/sampling ----
     server_model = copy.deepcopy(base_model_clean)
+    server_alpha = resolve_lora_alpha(args, global_rank)
     if not _is_lora_checkpoint:
         inject_lora_into_unet(
             server_model,
             rank=global_rank,
-            alpha=getattr(args, 'lora_alpha', 1.0),
+            alpha=server_alpha,
             dropout=getattr(args, 'lora_dropout', 0.0),
             target_layers=getattr(args, 'lora_target_layers', 'attention'),
         )
@@ -262,7 +296,7 @@ def run_training(args):
         inject_lora_into_unet(
             server_model,
             rank=global_rank,
-            alpha=getattr(args, 'lora_alpha', 1.0),
+            alpha=server_alpha,
             dropout=getattr(args, 'lora_dropout', 0.0),
             target_layers=getattr(args, 'lora_target_layers', 'attention'),
         )
@@ -282,10 +316,20 @@ def run_training(args):
         print(f'  Client {cid}: rank={r}, samples={n_data}')
 
     # ---- Create aggregator ----
+    agg_mode = getattr(args, 'agg_mode', 'fdlr')
+    if agg_mode in ('factor_avg', 'fedavg_lora'):
+        raise NotImplementedError(
+            f'agg_mode={agg_mode} is not implemented yet. '
+            f'Use agg_mode=fdlr or agg_mode=update_space for the current FedPhD-aligned protocol.'
+        )
+    use_procrustes = bool(getattr(args, 'use_procrustes', 1))
+    if agg_mode == 'update_space':
+        use_procrustes = False
+
     aggregator = HeteroLoRAAggregator(
         global_rank=global_rank,
-        rank_correction=True,
-        use_procrustes=True,
+        rank_correction=bool(getattr(args, 'rank_correction', 1)),
+        use_procrustes=use_procrustes,
         svd_method='rsvd',
         rank_beta=float(getattr(args, 'rank_beta', 0.5)),
     )
@@ -294,7 +338,10 @@ def run_training(args):
     # This is necessary for nested prefix distribution to be true from the beginning.
     init_factors = extract_all_lora_factors(server_model)
     B_init, A_init = factors_list_to_nested_dict(init_factors)
-    aggregator._last_distribution = prefix_slice_distribution(B_init, A_init, client_rank_map)
+    if bool(getattr(args, 'use_prefix_init', 1)):
+        aggregator._last_distribution = prefix_slice_distribution(B_init, A_init, client_rank_map)
+    else:
+        aggregator._last_distribution = {}
 
     # ---- Setup output directories ----
     _lr = getattr(args, 'lora_rank', 8)
@@ -340,6 +387,8 @@ def run_training(args):
             
             # Create or retrieve cached client
             if client_id not in client_cache:
+                client_rank = client_rank_map.get(client_id, 8)
+                client_alpha = resolve_lora_alpha(args, client_rank)
                 client_cache[client_id] = LoRAClient(
                     args=args,
                     dataset=train_dataset,
@@ -347,8 +396,8 @@ def run_training(args):
                     indices=client_groups[client_id],
                     time_steps=int(args.time_steps),
                     diffuser=diffuser,
-                    lora_rank=client_rank_map.get(client_id, 8),
-                    lora_alpha=getattr(args, 'lora_alpha', 1.0),
+                    lora_rank=client_rank,
+                    lora_alpha=client_alpha,
                 )
             
             client = client_cache[client_id]
@@ -374,11 +423,20 @@ def run_training(args):
             active_ranks[client_id] = client_rank_map.get(client_id, 8)
 
         # ---- Server-side aggregation ----
+        agg_t0 = time.time()
         agg_result = aggregator.aggregate_round(
             client_factors_list=local_factors_list,
             data_sizes=data_sizes,
             client_ranks=active_ranks,
         )
+        agg_time = time.time() - agg_t0
+        round_wall = time.time() - start_time
+        agg_result['stats']['server_aggregation_time_sec'] = float(agg_time)
+        agg_result['stats']['round_wall_clock_sec'] = float(round_wall)
+        agg_result['stats']['client_trainable_params'] = {
+            str(cid): int(client_cache[cid].get_trainable_param_count())
+            for cid in user_indices
+        }
         comm_stats_per_round.append(agg_result['stats'])
 
         # Cache distribution for next round's client receive step
@@ -420,7 +478,8 @@ def run_training(args):
                 args.image_size, args.num_channels, args.num_classes,
                 args.exp_rounds,
                 use_ddim=bool(getattr(args, 'use_ddim', 1)),
-                ddim_steps=getattr(args, 'ddim_steps', 100)
+                ddim_steps=getattr(args, 'ddim_steps', 100),
+                batch_size=getattr(args, 'eval_batch_size', 256)
             )
 
     # ---- Final save ----
@@ -446,15 +505,40 @@ def run_training(args):
     csv_path = result_folder / f'{model_name}.csv'
     with open(csv_path, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['round', 'loss', 'upload_kb', 'download_kb'])
+        writer.writerow([
+            'round',
+            'loss',
+            'upload_kb',
+            'download_kb',
+            'server_aggregation_time_sec',
+            'round_wall_clock_sec',
+        ])
         for idx, (loss, stats) in enumerate(zip(train_losses, comm_stats_per_round)):
             writer.writerow([
                 idx,
                 f'{loss:.6f}',
                 stats.get('upload_bytes', 0) / 1024,
                 stats.get('download_bytes', 0) / 1024,
+                stats.get('server_aggregation_time_sec', 0.0),
+                stats.get('round_wall_clock_sec', 0.0),
             ])
         writer.writerow(['runtime', time.time() - start_time])
+
+    central_interval = int(getattr(args, 'central_agg_interval', 5))
+    window_csv_path = result_folder / f'{model_name}_central_window_comm.csv'
+    with open(window_csv_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['window_start_round', 'upload_MB', 'download_MB', 'total_MB'])
+        for start in range(0, len(comm_stats_per_round), central_interval):
+            chunk = comm_stats_per_round[start:start + central_interval]
+            up = sum(s.get('upload_bytes', 0) for s in chunk)
+            down = sum(s.get('download_bytes', 0) for s in chunk)
+            writer.writerow([
+                start,
+                up / (1024 * 1024),
+                down / (1024 * 1024),
+                (up + down) / (1024 * 1024),
+            ])
 
     print(f'\n{"="*60}')
     print(f'Training Complete!')
@@ -473,6 +557,7 @@ def run_training(args):
     print(f'Model saved to: {final_path}')
     print(f'Results folder: {result_folder}')
     print(f'Loss CSV: {csv_path}')
+    print(f'Central-window communication CSV: {window_csv_path}')
     print(f'{"="*60}')
 
 
@@ -483,10 +568,13 @@ def run_inference(args):
 
     # ---- Set custom data root if provided (same as run_training) ----
     data_root = getattr(args, 'data_root', '')
+    download_dataset = bool(getattr(args, 'download_dataset', 0))
+    import utils as _utils
     if data_root:
-        import utils as _utils
         _utils._CUSTOM_DATA_ROOT = data_root
         print(f'Using custom data root: {data_root}')
+    _utils._DOWNLOAD_DATASET = download_dataset
+    _utils._PARTITION_RULE = getattr(args, 'partition', '')
 
     image_size = args.image_size
     is_conditional = args.conditional == 1
@@ -511,7 +599,7 @@ def run_inference(args):
         print('[Warning] No trained model found, building untrained model')
         model = build_base_model(args, device)
         inject_lora_into_unet(model, rank=lora_rank,
-                              alpha=getattr(args, 'lora_alpha', 1.0),
+                              alpha=resolve_lora_alpha(args, lora_rank),
                               target_layers='attention')
         model.eval()
 
@@ -532,7 +620,8 @@ def run_inference(args):
                        int(args.time_steps), image_size, channels,
                        args.num_classes, args.export_samples,
                        use_ddim=bool(getattr(args, 'use_ddim', 1)),
-                       ddim_steps=getattr(args, 'ddim_steps', 100))
+                       ddim_steps=getattr(args, 'ddim_steps', 100),
+                       batch_size=getattr(args, 'eval_batch_size', 256))
         print(f'Exported {args.export_samples} samples to {export_dir}')
 
     # ---- Show samples ----
@@ -554,7 +643,7 @@ def run_inference(args):
         fake_dir = parent_path / f'exports/{model_name}'
         real_dir = parent_path / f'exports/{args.dataset}/dataset'
         print(f'\n{"="*50}')
-        print(f'Computing FID & Precision/Recall...')
+        print(f'Computing FID, IS & Precision/Recall...')
         print(f'  Real (reference): {real_dir}')
         print(f'  Fake (generated): {fake_dir}')
         print(f'{"="*50}')
@@ -569,8 +658,14 @@ def run_inference(args):
         _eval_log_dir = parent_path / 'results' / 'eval_logs'
 
         perform_evaluation(real_path=str(real_dir), fake_path=str(fake_dir),
-                           num_samples=min(args.export_samples, args.export_dataset),
-                           eval_log_dir=str(_eval_log_dir), config_tag=_tag)
+                           num_samples=min(
+                               int(getattr(args, 'eval_num_samples', 30000)),
+                               args.export_samples,
+                               args.export_dataset,
+                           ),
+                           eval_log_dir=str(_eval_log_dir), config_tag=_tag,
+                           batch_size=getattr(args, 'eval_batch_size', 256),
+                           compute_is=bool(getattr(args, 'compute_is', 1)))
 
 
 def add_lora_arguments(parser):
@@ -584,10 +679,22 @@ def add_lora_arguments(parser):
                         help='Server-side global LoRA rank for aggregation (default: 16)')
     parser.add_argument('--lora_alpha', type=float, default=-1.0,
                         help='LoRA alpha. Use <=0 for alpha=rank, so scaling=1 (default: -1).')
+    parser.add_argument('--lora_alpha_mode', type=str, default='rank',
+                        choices=['rank', 'fixed'],
+                        help='rank: alpha=rank so LoRA scaling=1; fixed: use --lora_alpha.')
     parser.add_argument('--lora_dropout', type=float, default=0.0,
                         help='Dropout probability for LoRA path (default: 0.0)')
     parser.add_argument('--rank_beta', type=float, default=0.5,
                         help='Rank correction beta in eta(r)=r^(-beta). Use 0, 0.5, or 1 for ablations.')
+    parser.add_argument('--rank_correction', type=int, default=1,
+                        help='Whether to use rank correction in aggregation.')
+    parser.add_argument('--use_procrustes', type=int, default=1,
+                        help='Whether to use Procrustes alignment.')
+    parser.add_argument('--use_prefix_init', type=int, default=1,
+                        help='Whether clients receive prefix initialization before round 0.')
+    parser.add_argument('--agg_mode', type=str, default='fdlr',
+                        choices=['fedavg_lora', 'factor_avg', 'update_space', 'fdlr'],
+                        help='Aggregation mode. Currently fdlr and update_space are implemented.')
 
 
 def main(external_args=None):
@@ -618,18 +725,39 @@ def main(external_args=None):
     p.add_argument('--data_root', type=str, default='',
                     help='Custom data root path (overrides default). '
                          'E.g., --data_root=D:\\\\data\\\\CelebA')
+    p.add_argument('--download_dataset', type=int, default=0,
+                   help='Whether torchvision should download the dataset.')
+    p.add_argument('--partition', type=str, default='',
+                   help='Partition rule: fedphd-cifar2, fedphd-celeba4, or empty for existing split.')
     p.add_argument('--image_size', type=int, default=28)
     p.add_argument('--num_channels', type=int, default=1)
     p.add_argument('--iid', type=int, default=1)
     p.add_argument('--unequal', type=int, default=0)
     p.add_argument('--num_classes', type=int, default=10)
     p.add_argument('--round_offset', type=int, default=0)
+    p.add_argument('--seed', type=int, default=2023)
+    p.add_argument('--model_dim', type=int, default=0,
+                   help='Base channel dimension of U-Net. If 0, fallback to image_size.')
+    p.add_argument('--dim_mults', type=str, default='1,2,4',
+                   help='Comma-separated U-Net dim multipliers, e.g. 1,2,2,2.')
 
     # Export args
     p.add_argument('--export_samples', type=int, default=0)
     p.add_argument('--export_dataset', type=int, default=0)
     p.add_argument('--show_samples', type=int, default=0)
     p.add_argument('--exp_rounds', type=int, default=0)
+    p.add_argument('--use_ddim', type=int, default=1,
+                   help='Use DDIM sampling for evaluation/export.')
+    p.add_argument('--ddim_steps', type=int, default=100,
+                   help='DDIM sampling steps.')
+    p.add_argument('--eval_num_samples', type=int, default=30000,
+                   help='Number of generated samples for FedPhD-aligned evaluation.')
+    p.add_argument('--eval_batch_size', type=int, default=256,
+                   help='Batch size for FedPhD-aligned generation/evaluation.')
+    p.add_argument('--central_agg_interval', type=int, default=5,
+                   help='For FedPhD-style communication reporting. Default 5.')
+    p.add_argument('--compute_is', type=int, default=1,
+                   help='Whether to compute Inception Score during evaluation.')
 
     # Add LoRA-specific args
     add_lora_arguments(p)

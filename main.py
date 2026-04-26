@@ -33,8 +33,11 @@ if str_src not in sys.path:
 # ============================================================
 
 # ---- 数据集选择 ----
-DATASET = 'fmnist'          # 数据集: celeba | fmnist
+DATASET = 'cifar10'          # 数据集: celeba | fmnist | cifar10
 DATA_ROOT = ''                 # 自定义数据路径 (留空则根据 DATASET 自动匹配)
+DOWNLOAD_DATASET = 0           # torchvision 是否自动下载数据
+PARTITION = ''                 # fedphd-cifar2 | fedphd-celeba4 | 空字符串
+SEED = 2023                    # 随机种子
 
 # ---- 训练方法选择 ----
 METHOD = 'lora'             # 方法: lora | fedavg
@@ -55,14 +58,21 @@ TIME_STEPS = 1000           # 扩散步数 T
 CONDITIONAL = -1            # 条件生成 (=-1按数据集自动: FMNIST=1, CelebA=0)
 LR = 1e-4                   # 学习率 (扩散模型建议不要超过 1e-4)
 OPTIMIZER = 'adam'          # 优化器
+MODEL_DIM = 0               # U-Net base channels；0 表示使用 image_size
+DIM_MULTS = '1,2,4'         # U-Net dim multipliers，例如 FedPhD 对齐可试 1,2,2,2
 
 # ---- LoRA 专用 (仅 METHOD=lora 时生效) ----
 LORA_RANK = 8               # 基础 LoRA rank
 LORA_RANKS = '4,8,16,8,4'   # 各客户端逗号分隔的 rank, 如 "4,8,16,8,4" (留空则全部用 LORA_RANK)
 GLOBAL_LORA_RANK = 16       # 服务端全局 rank，必须 >= 最大客户端 rank
 LORA_ALPHA = -1.0           # <=0 表示 alpha=rank，使 LoRA scaling=1
+LORA_ALPHA_MODE = 'rank'    # rank: alpha=rank；fixed: 使用 LORA_ALPHA
 LORA_DROPOUT = 0.1          # LoRA dropout
 RANK_BETA = 0.5             # rank 校正 eta(r)=r^(-beta)，消融可设 0/0.5/1
+RANK_CORRECTION = 1         # 是否启用 rank 校正
+USE_PROCRUSTES = 1          # 是否启用 Procrustes 对齐
+USE_PREFIX_INIT = 1         # 第 0 轮前是否 prefix 初始化
+AGG_MODE = 'fdlr'           # fdlr | update_space | factor_avg | fedavg_lora
 
 FEDAVG_TRAIN_MODE = 'full'  # full | usplit | udec | ulatdec
 MOMENTUM = 0.5              # SGD momentum
@@ -73,6 +83,10 @@ EXPORT_SAMPLES = 0          # 生成图片数量
 EXPORT_DATASET = 0          # 导出真实数据样本数 (FID参照)
 SHOW_SAMPLES = 0            # 展示样本
 EXP_ROUNDS = 0              # 中间轮次导出间隔
+EVAL_NUM_SAMPLES = 30000    # FedPhD 对齐评估生成样本数
+EVAL_BATCH_SIZE = 256       # FedPhD 对齐评估 batch size
+CENTRAL_AGG_INTERVAL = 5    # FedPhD central aggregation 通信统计窗口
+COMPUTE_IS = 1              # 评估时计算 Inception Score
 
 # ---- DDIM 加速采样 ----
 USE_DDIM = 1                # 使用 DDIM 采样 (1=开启, 0=关闭/使用 DDPM)
@@ -91,6 +105,22 @@ DATASET_CONFIGS = {
         'conditional': 1,           # FMNIST 必须用条件生成
         'default_model': 'model_fmnist.pth',
         'data_root': r'D:\data\fashion-mnist-master',
+    },
+    'cifar10': {
+        'image_size': 32,
+        'num_channels': 3,
+        'num_classes': 10,
+        'conditional': 0,           # FedPhD CIFAR10 协议默认无条件生成
+        'default_model': 'model_cifar.pth',
+        'data_root': r'D:\data\cifar-10-python',
+    },
+    'cifar': {
+        'image_size': 32,
+        'num_channels': 3,
+        'num_classes': 10,
+        'conditional': 0,
+        'default_model': 'model_cifar.pth',
+        'data_root': r'D:\data\cifar-10-python',
     },
     'celeba': {
         'image_size': 64,
@@ -180,6 +210,39 @@ PRESETS = {
         'lora_alpha': -1.0, 'rank_beta': 0.5,
         'train': 1,
     },
+    'cifar10_lora_quick': {
+        'description': 'CIFAR10 LoRA 快速实验',
+        'method': 'lora', 'dataset': 'cifar10',
+        'rounds': 10, 'num_users': 5, 'local_ep': 3, 'local_bs': 128,
+        'lr': 1e-4,
+        'lora_rank': 8, 'lora_ranks': '4,8,16,8,4', 'global_lora_rank': 16,
+        'lora_alpha': -1.0, 'rank_beta': 0.5,
+        'train': 1,
+    },
+    'cifar10_fedphd_smoke': {
+        'description': 'CIFAR10 FedPhD 协议 smoke test (R=2)',
+        'method': 'lora', 'dataset': 'cifar10',
+        'rounds': 2, 'num_users': 20, 'frac': 0.2, 'local_ep': 1, 'local_bs': 32,
+        'iid': 0, 'unequal': 0, 'partition': 'fedphd-cifar2',
+        'time_steps': 100, 'conditional': 0,
+        'model_dim': 128, 'dim_mults': '1,2,2,2',
+        'lora_ranks': '4,8,16,4,8,16,4,8,16,4,8,16,4,8,16,4,8,16,4,8',
+        'global_lora_rank': 16, 'lora_alpha_mode': 'rank',
+        'use_ddim': 1, 'ddim_steps': 100, 'eval_num_samples': 1000, 'eval_batch_size': 256,
+        'central_agg_interval': 5, 'seed': 2023, 'train': 1,
+    },
+    'cifar10_fedphd_protocol': {
+        'description': 'CIFAR10 FedPhD baseline-equivalent 协议 (R=2000, E=5)',
+        'method': 'lora', 'dataset': 'cifar10',
+        'rounds': 2000, 'num_users': 20, 'frac': 0.2, 'local_ep': 5, 'local_bs': 128,
+        'iid': 0, 'unequal': 0, 'partition': 'fedphd-cifar2',
+        'time_steps': 100, 'conditional': 0,
+        'model_dim': 128, 'dim_mults': '1,2,2,2',
+        'lora_ranks': '4,8,16,4,8,16,4,8,16,4,8,16,4,8,16,4,8,16,4,8',
+        'global_lora_rank': 16, 'lora_alpha_mode': 'rank',
+        'use_ddim': 1, 'ddim_steps': 100, 'eval_num_samples': 30000, 'eval_batch_size': 256,
+        'central_agg_interval': 5, 'seed': 2023, 'train': 1,
+    },
     'infer_celeba': {
         'description': 'CelebA 推理: 生成图片 + FID评估',
         'method': 'lora', 'dataset': 'celeba',
@@ -192,6 +255,13 @@ PRESETS = {
         'method': 'lora', 'dataset': 'fmnist',
         'train': 0,
         'load_model': 'flora_model_fmnist_R[15]_K[5]_E[5].pth',
+        'export_samples': 5000, 'export_dataset': 5000,
+    },
+    'infer_cifar10': {
+        'description': 'CIFAR10 推理: 生成图片 + FID评估',
+        'method': 'lora', 'dataset': 'cifar10',
+        'train': 0,
+        'load_model': 'flora_model_cifar10_R[10]_K[5]_E[3].pth',
         'export_samples': 5000, 'export_dataset': 5000,
     },
 }
@@ -224,6 +294,9 @@ def build_args_from_config():
         # 数据集 (自动填充 image_size/num_channels/num_classes/data_root)
         dataset=DATASET,
         data_root=auto_data_root(DATASET),
+        download_dataset=DOWNLOAD_DATASET,
+        partition=PARTITION,
+        seed=SEED,
         image_size=ds_cfg['image_size'],
         num_channels=ds_cfg['num_channels'],
         num_classes=ds_cfg['num_classes'],
@@ -242,18 +315,29 @@ def build_args_from_config():
         conditional=ds_cfg.get('conditional', CONDITIONAL),  # 按数据集自动匹配
         lr=LR,
         optimizer=OPTIMIZER,
+        model_dim=MODEL_DIM,
+        dim_mults=DIM_MULTS,
         # 导出
         export_samples=EXPORT_SAMPLES,
         export_dataset=EXPORT_DATASET,
         show_samples=SHOW_SAMPLES,
         exp_rounds=EXP_ROUNDS,
+        eval_num_samples=EVAL_NUM_SAMPLES,
+        eval_batch_size=EVAL_BATCH_SIZE,
+        central_agg_interval=CENTRAL_AGG_INTERVAL,
+        compute_is=COMPUTE_IS,
         # LoRA
         lora_rank=LORA_RANK,
         lora_ranks=LORA_RANKS,
         global_lora_rank=GLOBAL_LORA_RANK,
         lora_alpha=LORA_ALPHA,
+        lora_alpha_mode=LORA_ALPHA_MODE,
         lora_dropout=LORA_DROPOUT,
         rank_beta=RANK_BETA,
+        rank_correction=RANK_CORRECTION,
+        use_procrustes=USE_PROCRUSTES,
+        use_prefix_init=USE_PREFIX_INIT,
+        agg_mode=AGG_MODE,
         # FedAvg
         train_mode=FEDAVG_TRAIN_MODE,
         momentum=MOMENTUM,
@@ -274,6 +358,9 @@ def apply_cli_overrides(args):
     parser.add_argument('--preset', type=str, default='')
     parser.add_argument('--dataset', type=str)
     parser.add_argument('--data_root', type=str)
+    parser.add_argument('--download_dataset', type=int)
+    parser.add_argument('--partition', type=str)
+    parser.add_argument('--seed', type=int)
     parser.add_argument('--image_size', type=int)
     parser.add_argument('--num_channels', type=int)
     parser.add_argument('--num_classes', type=int)
@@ -290,16 +377,27 @@ def apply_cli_overrides(args):
     parser.add_argument('--conditional', type=int)
     parser.add_argument('--lr', type=float)
     parser.add_argument('--optimizer', type=str)
+    parser.add_argument('--model_dim', type=int)
+    parser.add_argument('--dim_mults', type=str)
     parser.add_argument('--export_samples', type=int)
     parser.add_argument('--export_dataset', type=int)
     parser.add_argument('--show_samples', type=int)
     parser.add_argument('--exp_rounds', type=int)
+    parser.add_argument('--eval_num_samples', type=int)
+    parser.add_argument('--eval_batch_size', type=int)
+    parser.add_argument('--central_agg_interval', type=int)
+    parser.add_argument('--compute_is', type=int)
     parser.add_argument('--lora_rank', type=int)
     parser.add_argument('--lora_ranks', type=str)
     parser.add_argument('--global_lora_rank', type=int)
     parser.add_argument('--lora_alpha', type=float)
+    parser.add_argument('--lora_alpha_mode', type=str)
     parser.add_argument('--lora_dropout', type=float)
     parser.add_argument('--rank_beta', type=float)
+    parser.add_argument('--rank_correction', type=int)
+    parser.add_argument('--use_procrustes', type=int)
+    parser.add_argument('--use_prefix_init', type=int)
+    parser.add_argument('--agg_mode', type=str)
     parser.add_argument('--train_mode', type=str)
     parser.add_argument('--momentum', type=float)
     parser.add_argument('--round_offset', type=int)
@@ -350,9 +448,15 @@ def print_config_summary(args):
         extra.append(f"rank={args.lora_rank}(client)/{args.global_lora_rank}(global)")
         if getattr(args, 'lora_ranks', ''):
             extra.append(f"hetero={args.lora_ranks}")
+        extra.append(f"agg={getattr(args, 'agg_mode', 'fdlr')}")
         extra.append(f"beta={getattr(args, 'rank_beta', 0.5)}")
+        extra.append(f"alpha_mode={getattr(args, 'lora_alpha_mode', 'rank')}")
     elif hasattr(args, 'train_mode'):
         extra.append(f"mode={args.train_mode}")
+    if getattr(args, 'partition', ''):
+        extra.append(f"partition={args.partition}")
+    if getattr(args, 'model_dim', 0):
+        extra.append(f"model_dim={args.model_dim}, dim_mults={args.dim_mults}")
 
     print(f'\n{"═"*56}')
     print(f'  FedDiffuse  │  {method_tag:<20}│  {mode_tag:<10}')
@@ -366,6 +470,7 @@ def print_config_summary(args):
         print(f'  Data root   :  {args.data_root}')
     print(f'  Load model  :  {args.load_model or "(none)"}')
     print(f'  Sampling    :  {"DDIM (steps=" + str(args.ddim_steps) + ")" if args.use_ddim else "DDPM (steps=" + str(int(args.time_steps)) + ")"}')
+    print(f'  Eval        :  samples={getattr(args, "eval_num_samples", 30000)}, batch={getattr(args, "eval_batch_size", 256)}')
     print(f'{"═"*56}\n')
 
 
