@@ -64,7 +64,10 @@ def perform_evaluation(real_path, fake_path, dataset_to_export=None, num_samples
         eval_log_dir = Path(eval_log_dir)
         eval_log_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
-        log_name = f'{config_tag}_{ts}.log' if config_tag else f'eval_{ts}.log'
+        if config_tag and config_tag.endswith('.log'):
+            log_name = config_tag
+        else:
+            log_name = f'{config_tag}_{ts}.log' if config_tag else f'eval_{ts}.log'
         log_path = eval_log_dir / log_name
         with open(log_path, 'w', encoding='utf-8') as f:
             f.write(f'Evaluation Log  {ts}\n')

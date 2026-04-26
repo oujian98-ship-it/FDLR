@@ -22,6 +22,13 @@ import torch.nn.functional as F
 # Core LoRA Layer for Conv2d (1x1 conv == linear transform)
 # ============================================================
 
+def resolve_lora_alpha(rank: int, alpha: Optional[float] = None) -> float:
+    """Use alpha=rank by default so the effective LoRA scaling is 1."""
+    if alpha is None or alpha <= 0:
+        return float(rank)
+    return float(alpha)
+
+
 class LoRAConv2d(nn.Module):
     """
     LoRA wrapper around a frozen nn.Conv2d (kernel_size=1).
@@ -33,7 +40,7 @@ class LoRAConv2d(nn.Module):
     The original convolution weights are frozen.
     """
 
-    def __init__(self, conv_layer: nn.Conv2d, rank: int, alpha: float = 1.0,
+    def __init__(self, conv_layer: nn.Conv2d, rank: int, alpha: Optional[float] = None,
                  dropout: float = 0.0):
         super().__init__()
         assert conv_layer.kernel_size == (1, 1) or \
@@ -42,8 +49,8 @@ class LoRAConv2d(nn.Module):
 
         self.conv = conv_layer
         self.rank = rank
-        self.alpha = alpha
-        self.scaling = alpha / rank if rank > 0 else 0.0
+        self.alpha = resolve_lora_alpha(rank, alpha)
+        self.scaling = self.alpha / rank if rank > 0 else 0.0
 
         in_channels = conv_layer.in_channels
         out_channels = conv_layer.out_channels
@@ -92,13 +99,13 @@ class LoRAConv2d(nn.Module):
 class LoRALinear(nn.Module):
     """LoRA wrapper for nn.Linear (used for time_mlp etc.)"""
 
-    def __init__(self, linear_layer: nn.Linear, rank: int, alpha: float = 1.0,
+    def __init__(self, linear_layer: nn.Linear, rank: int, alpha: Optional[float] = None,
                  dropout: float = 0.0):
         super().__init__()
         self.linear = linear_layer
         self.rank = rank
-        self.alpha = alpha
-        self.scaling = alpha / rank if rank > 0 else 0.0
+        self.alpha = resolve_lora_alpha(rank, alpha)
+        self.scaling = self.alpha / rank if rank > 0 else 0.0
 
         in_features = linear_layer.in_features
         out_features = linear_layer.out_features
@@ -179,7 +186,7 @@ class LoRAInjectedAttention(nn.Module):
     """
 
     def __init__(self, original_attn: 'Attention', rank_qkv: int, rank_out: int,
-                 alpha: float = 1.0, dropout: float = 0.0):
+                 alpha: Optional[float] = None, dropout: float = 0.0):
         super().__init__()
 
         self.heads = original_attn.heads
@@ -312,7 +319,7 @@ class LoRAInjectedAttention(nn.Module):
 class LoRAInjectedLinearAttention(nn.Module):
 
     def __init__(self, original_attn: 'LinearAttention', rank_qkv: int, rank_out: int,
-                 alpha: float = 1.0, dropout: float = 0.0):
+                 alpha: Optional[float] = None, dropout: float = 0.0):
         super().__init__()
 
         self.heads = original_attn.heads
@@ -419,7 +426,7 @@ def inject_lora_into_unet(
     model: nn.Module,
     rank: int,
     rank_linear: int = 0,
-    alpha: float = 1.0,
+    alpha: Optional[float] = None,
     dropout: float = 0.0,
     target_layers: str = 'attention',
 ) -> nn.Module:
@@ -430,7 +437,7 @@ def inject_lora_into_unet(
         model: The base U-Net model (weights will be frozen after injection)
         rank: LoRA rank for Attention projection layers (Q/K/V/out)
         rank_linear: LoRA rank for time_mlp linear layers (default 0 = skip)
-        alpha: LoRA scaling factor (typically 1.0 or 2*rank)
+        alpha: LoRA scaling factor. Use None or <=0 to set alpha=rank and scaling=1.
         dropout: Dropout probability on LoRA path
         target_layers: Which layers to inject:
             - 'attention': only Attention and LinearAttention (recommended)
@@ -440,6 +447,7 @@ def inject_lora_into_unet(
         Modified model with LoRA injected (original model is modified in-place)
     """
     model_device = next(model.parameters()).device
+    effective_alpha = resolve_lora_alpha(rank, alpha)
     lora_config = {}  # Track injected modules for later factor extraction
 
     # --- Inject into downsampling blocks ---
@@ -447,7 +455,7 @@ def inject_lora_into_unet(
         # Each down block: [conv_block, conv_block, attn, downsample]
         _inject_into_block_list(
             model, f'downs.{block_idx}', block_list,
-            block_idx, rank, alpha, dropout, target_layers, lora_config, 'down'
+            block_idx, rank, effective_alpha, dropout, target_layers, lora_config, 'down'
         )
 
     # --- Inject into mid block ---
@@ -456,7 +464,7 @@ def inject_lora_into_unet(
         if isinstance(orig_mid_attn, type(None)):
             pass  # already handled via Residual(PreNorm(...))
         elif hasattr(orig_mid_attn, 'to_qkv'):  # Direct Attention
-            new_attn = LoRAInjectedAttention(orig_mid_attn, rank, rank, alpha, dropout)
+            new_attn = LoRAInjectedAttention(orig_mid_attn, rank, rank, effective_alpha, dropout)
             model.mid_attn.fn = new_attn
             lora_config[f'mid_attn'] = {'type': 'attention', 'rank_qkv': rank, 'rank_out': rank}
         elif hasattr(orig_mid_attn.fn, 'to_qkv'):  # Wrapped in PreNorm -> Residual -> PreNorm -> Attention
@@ -465,13 +473,13 @@ def inject_lora_into_unet(
                 attn_inner = inner.fn
                 from unet import Attention
                 if isinstance(attn_inner, Attention):
-                    new_attn = LoRAInjectedAttention(attn_inner, rank, rank, alpha, dropout)
+                    new_attn = LoRAInjectedAttention(attn_inner, rank, rank, effective_alpha, dropout)
                     inner.fn = new_attn
                     lora_config[f'mid_attn'] = {'type': 'attention', 'rank_qkv': rank, 'rank_out': rank}
                 else:
                     from unet import LinearAttention
                     if isinstance(attn_inner, LinearAttention):
-                        new_attn = LoRAInjectedLinearAttention(attn_inner, rank, rank, alpha, dropout)
+                        new_attn = LoRAInjectedLinearAttention(attn_inner, rank, rank, effective_alpha, dropout)
                         inner.fn = new_attn
                         lora_config[f'mid_attn'] = {'type': 'linear_attention', 'rank_qkv': rank, 'rank_out': rank}
 
@@ -479,14 +487,14 @@ def inject_lora_into_unet(
     for block_idx, block_list in enumerate(model.ups):
         _inject_into_block_list(
             model, f'ups.{block_idx}', block_list,
-            block_idx, rank, alpha, dropout, target_layers, lora_config, 'up'
+            block_idx, rank, effective_alpha, dropout, target_layers, lora_config, 'up'
         )
 
     # --- Optionally inject into time_mlp ---
     if target_layers == 'all' and rank_linear > 0 and hasattr(model, 'time_mlp'):
         for idx, layer in enumerate(model.time_mlp):
             if isinstance(layer, nn.Linear):
-                new_linear = LoRALinear(layer, rank=rank_linear, alpha=alpha, dropout=dropout)
+                new_linear = LoRALinear(layer, rank=rank_linear, alpha=resolve_lora_alpha(rank_linear, alpha), dropout=dropout)
                 model.time_mlp[idx] = new_linear
                 lora_config[f'time_mlp.{idx}'] = {'type': 'linear', 'rank': rank_linear}
 
@@ -496,9 +504,9 @@ def inject_lora_into_unet(
     # Store config for later use
     model._lora_config = lora_config
     model._lora_rank = rank
-    model._lora_alpha = alpha
+    model._lora_alpha = effective_alpha
 
-    print(f'[LoRA] Injected LoRA (rank={rank}, alpha={alpha}) into {len(lora_config)} modules')
+    print(f'[LoRA] Injected LoRA (rank={rank}, alpha={effective_alpha}, scaling={effective_alpha / rank if rank > 0 else 0.0}) into {len(lora_config)} modules')
     count_lora_params(model)
     
     return model

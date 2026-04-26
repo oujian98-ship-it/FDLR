@@ -178,6 +178,19 @@ def save_lora_checkpoint(model, path: Path, round_num: int = 0):
     print(f'Saved checkpoint: {path}')
 
 
+def save_lora_metadata(path: Path, model, args, client_rank_map, comm_stats, round_num: int):
+    """Save reproducibility metadata without changing the full-model checkpoint format."""
+    factors = extract_all_lora_factors(model)
+    torch.save({
+        'round': round_num,
+        'global_lora_factors': factors,
+        'client_ranks': dict(client_rank_map),
+        'communication_stats': list(comm_stats),
+        'experiment_args': vars(args) if hasattr(args, '__dict__') else {},
+    }, path)
+    print(f'Saved LoRA metadata: {path}')
+
+
 def run_training(args):
     """Main LoRA federated training loop."""
     start_time = time.time()
@@ -274,6 +287,7 @@ def run_training(args):
         rank_correction=True,
         use_procrustes=True,
         svd_method='rsvd',
+        rank_beta=float(getattr(args, 'rank_beta', 0.5)),
     )
 
     # Initialize client LoRA factors from the same server global subspace, even in round 0.
@@ -390,6 +404,10 @@ def run_training(args):
         if round_idx % max(1, args.rounds // 5) == 0 or round_idx == args.rounds - 1:
             ckpt_path = result_folder / f'{model_name}_R[{round_idx}].pth'
             save_lora_checkpoint(server_model, ckpt_path, round_idx)
+            save_lora_metadata(
+                ckpt_path.with_suffix('.metadata.pt'),
+                server_model, args, client_rank_map, comm_stats_per_round, round_idx
+            )
 
         # ---- Intermediate sampling ----
         if (args.exp_rounds > 0 and 
@@ -408,12 +426,20 @@ def run_training(args):
     # ---- Final save ----
     final_path = result_folder / f'{model_name}.pth'
     save_lora_checkpoint(server_model, final_path)
+    save_lora_metadata(
+        final_path.with_suffix('.metadata.pt'),
+        server_model, args, client_rank_map, comm_stats_per_round, args.rounds - 1
+    )
     
     # Save to project root with hyperparam tags
     _lr = getattr(args, 'lora_rank', 8)
     final_model_name = f'flora_model_{args.dataset}_R[{args.rounds}]_K[{args.num_users}]_E[{args.local_ep}]'
     final_model_path = parent_path / f'{final_model_name}.pth'
     save_lora_checkpoint(server_model, final_model_path)
+    save_lora_metadata(
+        final_model_path.with_suffix('.metadata.pt'),
+        server_model, args, client_rank_map, comm_stats_per_round, args.rounds - 1
+    )
     print(f'\nFinal model saved: {final_model_path}')
 
     # ---- Export loss CSV ----
@@ -537,11 +563,9 @@ def run_inference(args):
         _ts = _dt.datetime.now().strftime('%Y%m%d-%H%M%S')
         _lora_rank = getattr(args, 'lora_rank', 8)
         _global_rank = getattr(args, 'global_lora_rank', _lora_rank)
-        _iid_tag = f'I[{args.iid},{args.unequal}]'
-        _tag = (f'lora_{args.dataset}_R[{args.rounds}]_K[{args.num_users}]'
+        _tag = (f'{args.dataset}_R[{args.rounds}]_K[{args.num_users}]'
                 f'_r[{_lora_rank}g{_global_rank}]_E[{args.local_ep}]'
-                f'_B[{args.local_bs}]_T[{int(args.time_steps)}]'
-                f'_{_iid_tag}')
+                f'_B[{args.local_bs}]_{_ts}.log')
         _eval_log_dir = parent_path / 'results' / 'eval_logs'
 
         perform_evaluation(real_path=str(real_dir), fake_path=str(fake_dir),
@@ -558,10 +582,12 @@ def add_lora_arguments(parser):
                              'Overrides lora_rank if set.')
     parser.add_argument('--global_lora_rank', type=int, default=16,
                         help='Server-side global LoRA rank for aggregation (default: 16)')
-    parser.add_argument('--lora_alpha', type=float, default=1.0,
-                        help='LoRA scaling factor alpha (default: 1.0)')
+    parser.add_argument('--lora_alpha', type=float, default=-1.0,
+                        help='LoRA alpha. Use <=0 for alpha=rank, so scaling=1 (default: -1).')
     parser.add_argument('--lora_dropout', type=float, default=0.0,
                         help='Dropout probability for LoRA path (default: 0.0)')
+    parser.add_argument('--rank_beta', type=float, default=0.5,
+                        help='Rank correction beta in eta(r)=r^(-beta). Use 0, 0.5, or 1 for ablations.')
 
 
 def main(external_args=None):

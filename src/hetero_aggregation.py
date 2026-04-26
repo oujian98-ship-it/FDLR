@@ -16,7 +16,6 @@ References:
   [2] LoRA-FAIR: Federated LoRA Fine-Tuning with Aggregation and Initialization Refinement
 """
 
-import math
 from collections import OrderedDict
 from typing import Dict, List, Optional, Tuple
 
@@ -74,6 +73,7 @@ def compute_aggregation_weights(
     data_sizes: Dict[int, int],
     client_ranks: Dict[int, int],  # client_id -> rank used by this client
     rank_correction: bool = True,
+    rank_beta: float = 0.5,
 ) -> Dict[int, float]:
     """
     Compute per-client aggregation weights with optional rank correction.
@@ -97,7 +97,7 @@ def compute_aggregation_weights(
         r_i = client_ranks.get(cid, 1)
         
         if rank_correction and r_i > 0:
-            eta = 1.0 / math.sqrt(r_i)
+            eta = float(r_i) ** (-rank_beta)
         else:
             eta = 1.0
         
@@ -354,7 +354,7 @@ def procrustes_alignment(
             
             if b_n.shape[1] == b_p.shape[1]:  # same rank
                 r = b_n.shape[1]
-                m_k = b_p.t() @ b_n + a_n @ a_p.t()  # [r, r]
+                m_k = b_n.t() @ b_p + a_n @ a_p.t()  # [r, r]
                 if M_joint is None:
                     M_joint = torch.zeros(r, r, device=device)
                 M_joint += m_k
@@ -427,7 +427,7 @@ def procrustes_alignment_per_layer(
         Al = A_new[layer_name]
         Bl_prev = B_prev[layer_name]
 
-        keys = set(Bl.keys()) & set(Bl_prev.keys())
+        keys = set(Bl.keys())
         if not keys:
             B_aligned[layer_name] = dict(Bl)
             A_aligned[layer_name] = dict(Al)
@@ -438,8 +438,14 @@ def procrustes_alignment_per_layer(
 
         for k in keys:
             b = Bl[k]          # [out_dim, r]
-            b_prev = Bl_prev[k] # [out_dim, r_prev]
             a = Al[k]          # [r, in_dim]
+
+            if k not in Bl_prev:
+                B_aligned[layer_name][k] = b.clone()
+                A_aligned[layer_name][k] = a.clone()
+                continue
+
+            b_prev = Bl_prev[k] # [out_dim, r_prev]
 
             # Only align when rank matches between rounds
             if b.shape[1] != b_prev.shape[1]:
@@ -453,16 +459,16 @@ def procrustes_alignment_per_layer(
             try:
                 # Full objective from paper: min ||BQ - Bprev||^2 + ||Q'A - Aprev||^2
                 # After derivation (using Q'Q=I), equivalent to:
-                #   max_Q tr(Q' (B'^T @ B + A @ Aprev'))  =>  Q = U V'T from SVD(M)
+                #   max_Q tr(Q' (Bnew.T @ Bprev + Anew @ Aprev.T))  =>  Q = U V'T from SVD(M)
                 #
                 # Both terms are [r, r]:
-                #   Bprev.T @ Bnew:  [r, out] @ [out, r] = [r, r]
+                #   Bnew.T @ Bprev:  [r, out] @ [out, r] = [r, r]
                 #   Anew     @ Aprev': [r, in ] @ [in,  r] = [r, r]
                 if layer_name in A_prev and k in A_prev[layer_name]:
                     a_prev = A_prev[layer_name][k]
-                    M = b_prev.t() @ b + a @ a_prev.t()  # [r, r]
+                    M = b.t() @ b_prev + a @ a_prev.t()  # [r, r]
                 else:
-                    M = b_prev.t() @ b  # fallback: B-only
+                    M = b.t() @ b_prev  # fallback: B-only
                 U, _, Vt = torch.linalg.svd(M, full_matrices=False)
                 Q = U @ Vt  # [r, r], orthogonal
 
@@ -592,11 +598,13 @@ class HeteroLoRAAggregator:
     """
 
     def __init__(self, global_rank: int, rank_correction: bool = True,
-                 use_procrustes: bool = True, svd_method: str = 'rsvd'):
+                 use_procrustes: bool = True, svd_method: str = 'rsvd',
+                 rank_beta: float = 0.5):
         self.global_rank = global_rank
         self.rank_correction = rank_correction
         self.use_procrustes = use_procrustes
         self.svd_method = svd_method
+        self.rank_beta = rank_beta
         
         # Store previous round factors for Procrustes alignment
         self.B_prev = None
@@ -634,7 +642,9 @@ class HeteroLoRAAggregator:
               f'{len(true_deltas)} LoRA layers')
         
         # --- Step 2: Compute aggregation weights ---
-        agg_weights = compute_aggregation_weights(data_sizes, client_ranks, self.rank_correction)
+        agg_weights = compute_aggregation_weights(
+            data_sizes, client_ranks, self.rank_correction, self.rank_beta
+        )
         
         # --- Step 3: Aggregate in update space ---
         aggregated = aggregate_true_updates(true_deltas, agg_weights)
@@ -673,6 +683,8 @@ class HeteroLoRAAggregator:
         
         stats['upload_bytes'] = total_up_bytes
         stats['download_bytes'] = total_down_bytes
+        stats['rank_beta'] = float(self.rank_beta)
+        stats['rank_correction'] = bool(self.rank_correction)
         stats['agg_weights'] = {str(cid): float(w) for cid, w in agg_weights.items()}
         
         self.round_num += 1

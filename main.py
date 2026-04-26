@@ -41,10 +41,10 @@ METHOD = 'lora'             # 方法: lora | fedavg
 
 # ---- 联邦学习超参 ----
 ROUNDS = 15                 # 全局训练轮数 R
-NUM_USERS = 2               # 客户端数量 K
+NUM_USERS = 5               # 客户端数量 K
 FRAC = 1.0                  # 每轮参与客户端比例 C
 LOCAL_EP = 5                # 本地训练轮次 E
-LOCAL_BS = 64              # 本地 batch size B
+LOCAL_BS = 128              # 本地 batch size B
 IID = 1                     # IID=1 / Non-IID=0
 UNEQUAL = 0                 # 非均匀分布=1
 
@@ -57,11 +57,12 @@ LR = 1e-4                   # 学习率 (扩散模型建议不要超过 1e-4)
 OPTIMIZER = 'adam'          # 优化器
 
 # ---- LoRA 专用 (仅 METHOD=lora 时生效) ----
-LORA_RANK = 32               # 基础 LoRA rank
-LORA_RANKS = ''             # 各客户端逗号分隔的 rank, 如 "4,8,16,8,4" (留空则全部用 LORA_RANK)
-GLOBAL_LORA_RANK = 32       # 服务端全局 rank
-LORA_ALPHA = 0.8            # LoRA 缩放因子 α
+LORA_RANK = 8               # 基础 LoRA rank
+LORA_RANKS = '4,8,16,8,4'   # 各客户端逗号分隔的 rank, 如 "4,8,16,8,4" (留空则全部用 LORA_RANK)
+GLOBAL_LORA_RANK = 16       # 服务端全局 rank，必须 >= 最大客户端 rank
+LORA_ALPHA = -1.0           # <=0 表示 alpha=rank，使 LoRA scaling=1
 LORA_DROPOUT = 0.1          # LoRA dropout
+RANK_BETA = 0.5             # rank 校正 eta(r)=r^(-beta)，消融可设 0/0.5/1
 
 FEDAVG_TRAIN_MODE = 'full'  # full | usplit | udec | ulatdec
 MOMENTUM = 0.5              # SGD momentum
@@ -141,7 +142,8 @@ PRESETS = {
         'method': 'lora', 'dataset': 'celeba',
         'rounds': 10, 'num_users': 5, 'local_ep': 3, 'local_bs': 128,
         'lr': 1e-4,
-        'lora_rank': 8, 'global_lora_rank': 16,
+        'lora_rank': 8, 'lora_ranks': '4,8,16,8,4', 'global_lora_rank': 16,
+        'lora_alpha': -1.0, 'rank_beta': 0.5,
         'train': 1,
     },
     'celeba_lora_paper_align': {
@@ -149,7 +151,8 @@ PRESETS = {
         'method': 'lora', 'dataset': 'celeba',
         'rounds': 30, 'num_users': 5, 'local_ep': 5, 'local_bs': 64,
         'lr': 1e-4,
-        'lora_rank': 8, 'global_lora_rank': 16,
+        'lora_rank': 8, 'lora_ranks': '4,8,16,8,4', 'global_lora_rank': 16,
+        'lora_alpha': -1.0, 'rank_beta': 0.5,
         'train': 1,
     },
     'celeba_fedavg_baseline': {
@@ -173,7 +176,8 @@ PRESETS = {
         'method': 'lora', 'dataset': 'fmnist',
         'rounds': 10, 'num_users': 5, 'local_ep': 3, 'local_bs': 128,
         'lr': 1e-4,
-        'lora_rank': 8, 'global_lora_rank': 16,
+        'lora_rank': 8, 'lora_ranks': '4,8,16,8,4', 'global_lora_rank': 16,
+        'lora_alpha': -1.0, 'rank_beta': 0.5,
         'train': 1,
     },
     'infer_celeba': {
@@ -187,11 +191,10 @@ PRESETS = {
         'description': 'FMNIST 推理: 生成图片 + FID评估',
         'method': 'lora', 'dataset': 'fmnist',
         'train': 0,
-        'load_model': 'flora_model_fmnist_R[15]_K[2]_E[5].pth',
+        'load_model': 'flora_model_fmnist_R[15]_K[5]_E[5].pth',
         'export_samples': 5000, 'export_dataset': 5000,
     },
 }
-
 
 def apply_preset(preset_name):
     if preset_name not in PRESETS:
@@ -250,6 +253,7 @@ def build_args_from_config():
         global_lora_rank=GLOBAL_LORA_RANK,
         lora_alpha=LORA_ALPHA,
         lora_dropout=LORA_DROPOUT,
+        rank_beta=RANK_BETA,
         # FedAvg
         train_mode=FEDAVG_TRAIN_MODE,
         momentum=MOMENTUM,
@@ -295,6 +299,7 @@ def apply_cli_overrides(args):
     parser.add_argument('--global_lora_rank', type=int)
     parser.add_argument('--lora_alpha', type=float)
     parser.add_argument('--lora_dropout', type=float)
+    parser.add_argument('--rank_beta', type=float)
     parser.add_argument('--train_mode', type=str)
     parser.add_argument('--momentum', type=float)
     parser.add_argument('--round_offset', type=int)
@@ -343,6 +348,9 @@ def print_config_summary(args):
     extra = []
     if args.method == 'lora':
         extra.append(f"rank={args.lora_rank}(client)/{args.global_lora_rank}(global)")
+        if getattr(args, 'lora_ranks', ''):
+            extra.append(f"hetero={args.lora_ranks}")
+        extra.append(f"beta={getattr(args, 'rank_beta', 0.5)}")
     elif hasattr(args, 'train_mode'):
         extra.append(f"mode={args.train_mode}")
 

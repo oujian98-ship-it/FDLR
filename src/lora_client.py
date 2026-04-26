@@ -60,7 +60,7 @@ class LoRAClient:
         time_steps,          # Diffusion timesteps
         diffuser,            # Diffuser instance
         lora_rank: int = 8,  # This client's LoRA rank
-        lora_alpha: float = 1.0,
+        lora_alpha: float = -1.0,
     ):
         self.args = args
         self.indices = list(indices)
@@ -217,7 +217,7 @@ def create_heterogeneous_clients(
     time_steps,
     diffuser,
     rank_config,               # {client_id: rank} or list of ranks or single int
-    alpha: float = 1.0,
+    alpha: float = -1.0,
 ) -> Dict[int, LoRAClient]:
     """
     Create multiple LoRA clients with heterogeneous ranks.
