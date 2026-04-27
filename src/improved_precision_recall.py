@@ -32,6 +32,8 @@ from torchvision import transforms
 Manifold = namedtuple('Manifold', ['features', 'radii'])
 PrecisionAndRecall = namedtuple('PrecisinoAndRecall', ['precision', 'recall'])
 
+IPR_CHUNK_SIZE = int(os.environ.get('IPR_CHUNK_SIZE', '256'))
+
 
 class IPR():
     def __init__(self, batch_size=50, k=3, num_samples=10000, model=None):
@@ -119,8 +121,7 @@ class IPR():
             raise TypeError
 
         # radii
-        distances = compute_pairwise_distances(feats)
-        radii = distances2radii(distances, k=self.k)
+        radii = compute_radii(feats, k=self.k)
         return Manifold(feats, radii)
 
     def extract_features(self, images):
@@ -197,18 +198,17 @@ def compute_pairwise_distances(X, Y=None):
         num_Y = num_X
     else:
         num_Y = Y.shape[0]
-    X = X.astype(np.float64)  # to prevent underflow
+    X = X.astype(np.float32, copy=False)
     X_norm_square = np.sum(X ** 2, axis=1, keepdims=True)
     if Y is None:
         Y_norm_square = X_norm_square
     else:
+        Y = Y.astype(np.float32, copy=False)
         Y_norm_square = np.sum(Y ** 2, axis=1, keepdims=True)
-    X_square = np.repeat(X_norm_square, num_Y, axis=1)
-    Y_square = np.repeat(Y_norm_square.T, num_X, axis=0)
     if Y is None:
         Y = X
     XY = np.dot(X, Y.T)
-    diff_square = X_square - 2 * XY + Y_square
+    diff_square = X_norm_square - 2 * XY + Y_norm_square.T
 
     # check negative distance
     min_diff_square = diff_square.min()
@@ -220,6 +220,39 @@ def compute_pairwise_distances(X, Y=None):
 
     distances = np.sqrt(diff_square)
     return distances
+
+
+def compute_squared_distance_block(X_block, Y, Y_norm_square=None):
+    X_block = X_block.astype(np.float32, copy=False)
+    Y = Y.astype(np.float32, copy=False)
+    if Y_norm_square is None:
+        Y_norm_square = np.sum(Y ** 2, axis=1, keepdims=True)
+    X_norm_square = np.sum(X_block ** 2, axis=1, keepdims=True)
+    dist_square = X_norm_square - 2 * np.dot(X_block, Y.T) + Y_norm_square.T
+    np.maximum(dist_square, 0, out=dist_square)
+    return dist_square
+
+
+def compute_radii(features, k=3, chunk_size=IPR_CHUNK_SIZE):
+    num_features = features.shape[0]
+    if num_features == 0:
+        return np.zeros(0, dtype=np.float32)
+    features = features.astype(np.float32, copy=False)
+    feature_norm_square = np.sum(features ** 2, axis=1, keepdims=True)
+    radii = np.zeros(num_features, dtype=np.float32)
+    top_count = min(k + 1, num_features)
+    kth_index = top_count - 1
+
+    for start in tqdm(range(0, num_features, chunk_size), desc='computing kNN radii...'):
+        end = min(start + chunk_size, num_features)
+        dist_square = compute_squared_distance_block(
+            features[start:end],
+            features,
+            feature_norm_square,
+        )
+        kth_square = np.partition(dist_square, kth_index, axis=1)[:, :top_count].max(axis=1)
+        radii[start:end] = np.sqrt(kth_square)
+    return radii
 
 
 def distances2radii(distances, k=3):
@@ -241,9 +274,19 @@ def get_kth_value(np_array, k):
 def compute_metric(manifold_ref, feats_subject, desc=''):
     num_subjects = feats_subject.shape[0]
     count = 0
-    dist = compute_pairwise_distances(manifold_ref.features, feats_subject)
-    for i in trange(num_subjects, desc=desc):
-        count += (dist[:, i] < manifold_ref.radii).any()
+    features_ref = manifold_ref.features.astype(np.float32, copy=False)
+    feats_subject = feats_subject.astype(np.float32, copy=False)
+    ref_norm_square = np.sum(features_ref ** 2, axis=1, keepdims=True)
+    radii_square = manifold_ref.radii.astype(np.float32, copy=False) ** 2
+
+    for start in tqdm(range(0, num_subjects, IPR_CHUNK_SIZE), desc=desc):
+        end = min(start + IPR_CHUNK_SIZE, num_subjects)
+        dist_square = compute_squared_distance_block(
+            features_ref,
+            feats_subject[start:end],
+            np.sum(feats_subject[start:end] ** 2, axis=1, keepdims=True),
+        )
+        count += (dist_square < radii_square[:, None]).any(axis=0).sum()
     return count / num_subjects
 
 
@@ -311,7 +354,7 @@ class FileNames(Dataset):
         return len(self.fnames)
 
 
-def get_custom_loader(image_dir_or_fnames, image_size=224, batch_size=50, num_workers=4, num_samples=-1):
+def get_custom_loader(image_dir_or_fnames, image_size=224, batch_size=50, num_workers=None, num_samples=-1):
     transform = []
     transform.append(transforms.Resize([image_size, image_size]))
     transform.append(transforms.ToTensor())
@@ -328,11 +371,15 @@ def get_custom_loader(image_dir_or_fnames, image_size=224, batch_size=50, num_wo
 
     if num_samples > 0:
         dataset.fnames = dataset.fnames[:num_samples]
+    if num_workers is None:
+        num_workers = int(os.environ.get('EVAL_NUM_WORKERS', '0'))
+    pin_memory = os.environ.get('EVAL_PIN_MEMORY', '0') == '1'
+
     data_loader = DataLoader(dataset=dataset,
                              batch_size=batch_size,
                              shuffle=False,
                              num_workers=num_workers,
-                             pin_memory=True)
+                             pin_memory=pin_memory)
     return data_loader
 
 

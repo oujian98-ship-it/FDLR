@@ -409,16 +409,19 @@ def apply_cli_overrides(args):
 
     cli_args, _ = parser.parse_known_args()
 
-    for key, val in vars(cli_args).items():
-        if val is not None:
-            setattr(args, key, val)
+    if cli_args.preset is not None:
+        args.preset = cli_args.preset
 
-    # 处理预设
+    # 处理预设：先应用 preset，再用显式 CLI 参数覆盖。
     if args.preset:
         preset = apply_preset(args.preset)
         for key, value in preset.items():
             if key != 'description' and hasattr(args, key):
                 setattr(args, key, value)
+
+    for key, val in vars(cli_args).items():
+        if val is not None:
+            setattr(args, key, val)
 
     # 如果通过 --dataset 切换了数据集，重新自动匹配
     if hasattr(args, 'dataset') and args.dataset:

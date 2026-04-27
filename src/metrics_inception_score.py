@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
+import os
 from pathlib import Path
 
 import numpy as np
@@ -54,12 +55,14 @@ def calculate_inception_score(
 
     n = min(num_samples, len(dataset))
     subset = torch.utils.data.Subset(dataset, list(range(n)))
+    num_workers = int(os.environ.get("EVAL_NUM_WORKERS", "0"))
+    pin_memory = os.environ.get("EVAL_PIN_MEMORY", "0") == "1"
     loader = DataLoader(
         subset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=4,
-        pin_memory=(device == "cuda"),
+        num_workers=num_workers,
+        pin_memory=pin_memory,
     )
 
     model = inception_v3(
