@@ -296,6 +296,7 @@ def save_experiment_protocol(result_folder: Path, args, data_stats, num_params, 
         "eval_batch_size": getattr(args, "eval_batch_size", 256),
         "compute_is": getattr(args, "compute_is", 1),
         "eval_real_split": getattr(args, "eval_real_split", "train"),
+        "data_range": getattr(args, "data_range", "minus1_1"),
         "lora_ranks": getattr(args, "lora_ranks", ""),
         "global_lora_rank": getattr(args, "global_lora_rank", None),
         "lora_alpha_mode": getattr(args, "lora_alpha_mode", "rank"),
@@ -344,6 +345,7 @@ def run_training(args):
         print(f'Using custom data root: {data_root}')
     _utils._DOWNLOAD_DATASET = download_dataset
     _utils._PARTITION_RULE = getattr(args, 'partition', '')
+    _utils._DATA_RANGE = getattr(args, 'data_range', 'minus1_1')
 
     # ---- Load dataset & partition ----
     train_dataset, client_groups, data_stats = get_partitioned_dataset(args)
@@ -358,8 +360,13 @@ def run_training(args):
     if _load_path and _load_path.exists():
         try:
             _ck = torch.load(_load_path, map_location=device, weights_only=False)
-            # flora checkpoints save full model object (not dict)
-            if not isinstance(_ck, dict):
+            if (
+                not isinstance(_ck, dict)
+                and (
+                    hasattr(_ck, '_lora_config')
+                    or any('lora_' in name for name, _ in _ck.named_parameters())
+                )
+            ):
                 _is_lora_checkpoint = True
                 print(f'[Info] Loaded model is a LoRA checkpoint – reusing existing LoRA')
         except Exception:
@@ -602,7 +609,8 @@ def run_training(args):
                 args.exp_rounds,
                 use_ddim=bool(getattr(args, 'use_ddim', 1)),
                 ddim_steps=getattr(args, 'ddim_steps', 100),
-                batch_size=getattr(args, 'eval_batch_size', 256)
+                batch_size=getattr(args, 'eval_batch_size', 256),
+                data_range=getattr(args, 'data_range', 'minus1_1'),
             )
 
     # ---- Final save ----
@@ -744,7 +752,8 @@ def run_inference(args):
                        args.num_classes, args.export_samples,
                        use_ddim=bool(getattr(args, 'use_ddim', 1)),
                        ddim_steps=getattr(args, 'ddim_steps', 100),
-                       batch_size=getattr(args, 'eval_batch_size', 256))
+                       batch_size=getattr(args, 'eval_batch_size', 256),
+                       data_range=getattr(args, 'data_range', 'minus1_1'))
         print(f'Exported {args.export_samples} samples to {export_dir}')
 
     # ---- Show samples ----
@@ -760,7 +769,8 @@ def run_inference(args):
         real_split = getattr(args, 'eval_real_split', 'train')
         real_train = real_split == 'train'
         real_dir = parent_path / f'exports/{args.dataset}/dataset_{real_split}'
-        export_dataset(real_dir, args.dataset, args.export_dataset, train=real_train)
+        export_dataset(real_dir, args.dataset, args.export_dataset, train=real_train,
+                       data_range=getattr(args, 'data_range', 'minus1_1'))
         print(f'Exported {args.export_dataset} real {real_split} samples to {real_dir}')
 
     # ---- Auto FID evaluation (when both real and fake exist) ----
@@ -887,6 +897,9 @@ def main(external_args=None):
     p.add_argument('--eval_real_split', type=str, default='train',
                    choices=['train', 'test'],
                    help='Which real split to export for FID/IS reference. FedPhD-style uses train.')
+    p.add_argument('--data_range', type=str, default='minus1_1',
+                   choices=['minus1_1', '0_1'],
+                   help='Training/sample tensor range. Use 0_1 for legacy model_cifar.pth compatibility.')
 
     # Add LoRA-specific args
     add_lora_arguments(p)

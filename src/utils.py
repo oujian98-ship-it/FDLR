@@ -143,21 +143,27 @@ def transform_mnist(image):
 
 
 def transform_cifar10_train(image):
-    transform = transforms.Compose([
+    data_range = globals().get('_DATA_RANGE', 'minus1_1')
+    steps = [
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
-        transforms.Lambda(lambda t: (t * 2) - 1)])
+    ]
+    if data_range != '0_1':
+        steps.append(transforms.Lambda(lambda t: (t * 2) - 1))
+    transform = transforms.Compose(steps)
     return transform(image.convert("RGB"))
 
 
 def transform_cifar10_eval(image):
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Lambda(lambda t: (t * 2) - 1)])
+    data_range = globals().get('_DATA_RANGE', 'minus1_1')
+    steps = [transforms.ToTensor()]
+    if data_range != '0_1':
+        steps.append(transforms.Lambda(lambda t: (t * 2) - 1))
+    transform = transforms.Compose(steps)
     return transform(image.convert("RGB"))
 
 
-def save_image_01(tensor, path):
+def save_image_01(tensor, path, data_range='auto'):
     """
     Save image tensor safely for FID/IS evaluation.
 
@@ -165,7 +171,7 @@ def save_image_01(tensor, path):
     FID/IS image files should be saved in [0, 1].
     """
     x = tensor.detach().cpu()
-    if x.min() < 0:
+    if data_range == 'minus1_1' or (data_range == 'auto' and x.min() < 0):
         x = (x + 1.0) / 2.0
     x = x.clamp(0.0, 1.0)
     torchvision.utils.save_image(x, path)
@@ -195,7 +201,7 @@ def transform_celebhq(image):
     return transform(image)
 
 
-def export_dataset(folder, dataset_name, num_images=sys.maxsize, train=True, offset=0):
+def export_dataset(folder, dataset_name, num_images=sys.maxsize, train=True, offset=0, data_range='auto'):
     if not os.path.exists(folder):
         os.makedirs(folder)
 
@@ -205,7 +211,7 @@ def export_dataset(folder, dataset_name, num_images=sys.maxsize, train=True, off
         image, label = dataset[i]
         image_name = f'image_{offset + i}.png'
         image_path = os.path.join(folder, image_name)
-        save_image_01(image, image_path)
+        save_image_01(image, image_path, data_range=data_range)
 
 
 class CustomCelebA(Dataset):
@@ -592,7 +598,7 @@ def load_pickle_stats(filename):
 
 
 def export_samples(diffuser, folder, conditional, model, time_steps, image_size, channels, num_classes=10,
-                   num_images=1000, use_ddim=False, ddim_steps=100, batch_size=256):
+                   num_images=1000, use_ddim=False, ddim_steps=100, batch_size=256, data_range='auto'):
     if not os.path.exists(folder):
         os.makedirs(folder)
 
@@ -621,7 +627,7 @@ def export_samples(diffuser, folder, conditional, model, time_steps, image_size,
             image_name = f'image_{img_num}_label{labels[label_offset + i]}.png' if conditional else f'image{img_num}.png'
             img_num += 1
             image_path = os.path.join(folder, image_name)
-            save_image_01(images[-1][i], image_path)
+            save_image_01(images[-1][i], image_path, data_range=data_range)
         if conditional:
             label_offset += cur_batch_size
         num_to_go -= cur_batch_size

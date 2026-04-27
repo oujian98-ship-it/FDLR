@@ -68,6 +68,8 @@ def args_parser():
                         help='whether to compute Inception Score')
     parser.add_argument('--eval_real_split', type=str, default='train', choices=['train', 'test'],
                         help='which real split to export for FID/IS reference')
+    parser.add_argument('--data_range', type=str, default='minus1_1', choices=['minus1_1', '0_1'],
+                        help='training/sample tensor range')
     
     # DDIM acceleration
     parser.add_argument('--use_ddim', type=int, default=1, help="use DDIM sampler (1) or DDPM (0)")

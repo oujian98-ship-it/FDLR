@@ -33,21 +33,21 @@ if str_src not in sys.path:
 # ============================================================
 
 # ---- 数据集选择 ----
-DATASET = 'cifar10'          # 数据集: celeba | fmnist | cifar10
+DATASET = 'celeba'          # 数据集: celeba | fmnist | cifar10
 DATA_ROOT = ''                 # 自定义数据路径 (留空则根据 DATASET 自动匹配)
 DOWNLOAD_DATASET = 0           # torchvision 是否自动下载数据
 PARTITION = ''                 # fedphd-cifar2 | fedphd-celeba4 | 空字符串
-SEED = 2023                    # 随机种子
+SEED = 42                    # 随机种子
 
 # ---- 训练方法选择 ----
 METHOD = 'lora'             # 方法: lora | fedavg
 
 # ---- 联邦学习超参 ----
-ROUNDS = 15                 # 全局训练轮数 R
+ROUNDS = 30                 # 全局训练轮数 R
 NUM_USERS = 5               # 客户端数量 K
 FRAC = 1.0                  # 每轮参与客户端比例 C
 LOCAL_EP = 5                # 本地训练轮次 E
-LOCAL_BS = 128              # 本地 batch size B
+LOCAL_BS = 64              # 本地 batch size B
 IID = 1                     # IID=1 / Non-IID=0
 UNEQUAL = 0                 # 非均匀分布=1
 
@@ -63,7 +63,7 @@ DIM_MULTS = '1,2,4'         # U-Net dim multipliers，例如 FedPhD 对齐可试
 
 # ---- LoRA 专用 (仅 METHOD=lora 时生效) ----
 LORA_RANK = 8               # 基础 LoRA rank
-LORA_RANKS = '4,8,16,8,4'   # 各客户端逗号分隔的 rank, 如 "4,8,16,8,4" (留空则全部用 LORA_RANK)
+LORA_RANKS = ''   # 各客户端逗号分隔的 rank, 如 "4,8,16,8,4" (留空则全部用 LORA_RANK)
 GLOBAL_LORA_RANK = 16       # 服务端全局 rank，必须 >= 最大客户端 rank
 LORA_ALPHA = -1.0           # <=0 表示 alpha=rank，使 LoRA scaling=1
 LORA_ALPHA_MODE = 'rank'    # rank: alpha=rank；fixed: 使用 LORA_ALPHA
@@ -88,6 +88,7 @@ EVAL_BATCH_SIZE = 256       # FedPhD 对齐评估 batch size
 CENTRAL_AGG_INTERVAL = 5    # FedPhD central aggregation 通信统计窗口
 COMPUTE_IS = 1              # 评估时计算 Inception Score
 EVAL_REAL_SPLIT = 'train'   # FedPhD-style 使用 train split 作为真实参考
+DATA_RANGE = 'minus1_1'     # minus1_1=协议范围；0_1=兼容旧 model_cifar.pth
 
 # ---- DDIM 加速采样 ----
 USE_DDIM = 1                # 使用 DDIM 采样 (1=开启, 0=关闭/使用 DDPM)
@@ -168,22 +169,64 @@ def auto_select_model(dataset_name):
 # ============================================================
 
 PRESETS = {
-    'celeba_lora_quick': {
-        'description': 'CelebA LoRA 快速实验 (R=10, ~2.5h)',
+    'celeba_lora_quick_homo': {
+        'description': 'CelebA 同构 LoRA 快速实验 (R=10, rank=8)',
+        'method': 'lora', 'dataset': 'celeba',
+        'rounds': 10, 'num_users': 5, 'local_ep': 3, 'local_bs': 128,
+        'lr': 1e-4,
+        'lora_rank': 8, 'lora_ranks': '', 'global_lora_rank': 8,
+        'lora_alpha': -1.0, 'rank_beta': 0.5,
+        'eval_num_samples': 1000, 'eval_batch_size': 64,
+        'train': 1,
+    },
+    'celeba_lora_quick_hetero': {
+        'description': 'CelebA 异构 LoRA 快速实验 (R=10, ranks=4,8,16,8,4)',
         'method': 'lora', 'dataset': 'celeba',
         'rounds': 10, 'num_users': 5, 'local_ep': 3, 'local_bs': 128,
         'lr': 1e-4,
         'lora_rank': 8, 'lora_ranks': '4,8,16,8,4', 'global_lora_rank': 16,
         'lora_alpha': -1.0, 'rank_beta': 0.5,
+        'eval_num_samples': 1000, 'eval_batch_size': 64,
         'train': 1,
     },
-    'celeba_lora_paper_align': {
-        'description': 'CelebA LoRA 对齐论文 (R=30, E=5, B=64, ~7.5h)',
+    'celeba_lora_paper_align_homo': {
+        'description': 'CelebA 同构 LoRA 对齐实验 (R=30, E=5, B=64, rank=8)',
+        'method': 'lora', 'dataset': 'celeba',
+        'rounds': 30, 'num_users': 5, 'local_ep': 5, 'local_bs': 64,
+        'lr': 1e-4,
+        'lora_rank': 8, 'lora_ranks': '', 'global_lora_rank': 8,
+        'lora_alpha': -1.0, 'rank_beta': 0.5,
+        'eval_num_samples': 1000, 'eval_batch_size': 64,
+        'train': 1,
+    },
+    'celeba_lora_paper_align_hetero': {
+        'description': 'CelebA 异构 LoRA 对齐实验 (R=30, E=5, B=64, ranks=4,8,16,8,4)',
         'method': 'lora', 'dataset': 'celeba',
         'rounds': 30, 'num_users': 5, 'local_ep': 5, 'local_bs': 64,
         'lr': 1e-4,
         'lora_rank': 8, 'lora_ranks': '4,8,16,8,4', 'global_lora_rank': 16,
         'lora_alpha': -1.0, 'rank_beta': 0.5,
+        'eval_num_samples': 1000, 'eval_batch_size': 64,
+        'train': 1,
+    },
+    'celeba_lora_quick': {
+        'description': 'CelebA LoRA 快速实验 alias: 异构 (R=10)',
+        'method': 'lora', 'dataset': 'celeba',
+        'rounds': 10, 'num_users': 5, 'local_ep': 3, 'local_bs': 128,
+        'lr': 1e-4,
+        'lora_rank': 8, 'lora_ranks': '4,8,16,8,4', 'global_lora_rank': 16,
+        'lora_alpha': -1.0, 'rank_beta': 0.5,
+        'eval_num_samples': 1000, 'eval_batch_size': 64,
+        'train': 1,
+    },
+    'celeba_lora_paper_align': {
+        'description': 'CelebA LoRA 对齐实验 alias: 异构 (R=30, E=5, B=64)',
+        'method': 'lora', 'dataset': 'celeba',
+        'rounds': 30, 'num_users': 5, 'local_ep': 5, 'local_bs': 64,
+        'lr': 1e-4,
+        'lora_rank': 8, 'lora_ranks': '4,8,16,8,4', 'global_lora_rank': 16,
+        'lora_alpha': -1.0, 'rank_beta': 0.5,
+        'eval_num_samples': 1000, 'eval_batch_size': 64,
         'train': 1,
     },
     'celeba_fedavg_baseline': {
@@ -202,13 +245,34 @@ PRESETS = {
         'train_mode': 'full',
         'train': 1,
     },
-    'fmnist_lora_quick': {
-        'description': 'Fashion-MNIST LoRA 快速实验',
+    'fmnist_lora_quick_homo': {
+        'description': 'Fashion-MNIST 同构 LoRA 快速实验 (rank=8)',
+        'method': 'lora', 'dataset': 'fmnist',
+        'rounds': 10, 'num_users': 5, 'local_ep': 3, 'local_bs': 128,
+        'lr': 1e-4,
+        'lora_rank': 8, 'lora_ranks': '', 'global_lora_rank': 8,
+        'lora_alpha': -1.0, 'rank_beta': 0.5,
+        'eval_num_samples': 1000, 'eval_batch_size': 64,
+        'train': 1,
+    },
+    'fmnist_lora_quick_hetero': {
+        'description': 'Fashion-MNIST 异构 LoRA 快速实验 (ranks=4,8,16,8,4)',
         'method': 'lora', 'dataset': 'fmnist',
         'rounds': 10, 'num_users': 5, 'local_ep': 3, 'local_bs': 128,
         'lr': 1e-4,
         'lora_rank': 8, 'lora_ranks': '4,8,16,8,4', 'global_lora_rank': 16,
         'lora_alpha': -1.0, 'rank_beta': 0.5,
+        'eval_num_samples': 1000, 'eval_batch_size': 64,
+        'train': 1,
+    },
+    'fmnist_lora_quick': {
+        'description': 'Fashion-MNIST LoRA 快速实验 alias: 异构',
+        'method': 'lora', 'dataset': 'fmnist',
+        'rounds': 10, 'num_users': 5, 'local_ep': 3, 'local_bs': 128,
+        'lr': 1e-4,
+        'lora_rank': 8, 'lora_ranks': '4,8,16,8,4', 'global_lora_rank': 16,
+        'lora_alpha': -1.0, 'rank_beta': 0.5,
+        'eval_num_samples': 1000, 'eval_batch_size': 64,
         'train': 1,
     },
     'cifar10_lora_quick': {
@@ -280,10 +344,6 @@ def apply_preset(preset_name):
     return p
 
 
-# ============================================================
-# 4. 参数构建与解析
-# ============================================================
-
 def build_args_from_config():
     """从顶部配置 + 数据集自动匹配 构建 Namespace"""
     ds_cfg = get_dataset_config(DATASET)
@@ -328,6 +388,7 @@ def build_args_from_config():
         central_agg_interval=CENTRAL_AGG_INTERVAL,
         compute_is=COMPUTE_IS,
         eval_real_split=EVAL_REAL_SPLIT,
+        data_range=DATA_RANGE,
         # LoRA
         lora_rank=LORA_RANK,
         lora_ranks=LORA_RANKS,
@@ -390,6 +451,7 @@ def apply_cli_overrides(args):
     parser.add_argument('--central_agg_interval', type=int)
     parser.add_argument('--compute_is', type=int)
     parser.add_argument('--eval_real_split', type=str)
+    parser.add_argument('--data_range', type=str)
     parser.add_argument('--lora_rank', type=int)
     parser.add_argument('--lora_ranks', type=str)
     parser.add_argument('--global_lora_rank', type=int)
@@ -478,6 +540,7 @@ def print_config_summary(args):
     print(f'  Sampling    :  {"DDIM (steps=" + str(args.ddim_steps) + ")" if args.use_ddim else "DDPM (steps=" + str(int(args.time_steps)) + ")"}')
     print(f'  Eval        :  samples={getattr(args, "eval_num_samples", 30000)}, batch={getattr(args, "eval_batch_size", 256)}')
     print(f'  Real split  :  {getattr(args, "eval_real_split", "train")}')
+    print(f'  Data range  :  {getattr(args, "data_range", "minus1_1")}')
     print(f'{"═"*56}\n')
 
 
