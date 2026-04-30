@@ -46,7 +46,7 @@ from options import args_parser
 from unet import UnetConditional, Unet
 from utils import exp_details, DecoderTrainingTask, is_up_parameter, \
     is_mid_parameter, export_dataset, count_model_parameters, count_update_parameters, get_partitioned_dataset, \
-    export_samples, show_samples
+    export_samples, show_samples, perform_evaluation
 
 
 def parse_dim_mults(dim_mults_str: str):
@@ -143,6 +143,8 @@ def main(args):
                  f'I[{args.iid},{args.unequal}]_' \
                  f'Y[{args.conditional}]_' \
                  f'{args.train_mode}'
+    if args.train == 0 and args.load_model:
+        model_name = f'infer_{Path(args.load_model).stem}'
 
     # Build model structure first (always needed for training)
     global_model = UnetConditional(
@@ -343,15 +345,59 @@ def main(args):
             print(f'Also saved to project root: {root_model_name}')
 
     if args.export_dataset > 0:
-        export_dataset(parent_path / f'exports/{args.dataset}/dataset', args.dataset, args.export_dataset,
-                       train=False)
+        real_split = getattr(args, 'eval_real_split', 'train')
+        real_train = real_split == 'train'
+        real_dir = parent_path / f'exports/{args.dataset}/dataset_{real_split}'
+        export_dataset(real_dir, args.dataset, args.export_dataset,
+                       train=real_train,
+                       data_range=getattr(args, 'data_range', 'minus1_1'))
+        print(f'Exported {args.export_dataset} real {real_split} samples to {real_dir}')
     if args.export_samples > 0:
-        export_samples(diffuser, parent_path / f'exports/{model_name}', is_conditional, global_model,
-                       args.time_steps,
-                      image_size, channels, args.num_classes, args.export_samples,
-                      use_ddim=bool(getattr(args, 'use_ddim', 1)),
-                      ddim_steps=getattr(args, 'ddim_steps', 100),
-                      batch_size=getattr(args, 'eval_batch_size', 256))
+        fake_dir = parent_path / f'exports/{model_name}'
+        export_samples(diffuser, fake_dir, is_conditional, global_model,
+                       int(args.time_steps),
+                       image_size, channels, args.num_classes, args.export_samples,
+                       use_ddim=bool(getattr(args, 'use_ddim', 1)),
+                       ddim_steps=getattr(args, 'ddim_steps', 100),
+                       batch_size=getattr(args, 'eval_batch_size', 256),
+                       data_range=getattr(args, 'data_range', 'minus1_1'))
+        print(f'Exported {args.export_samples} generated samples to {fake_dir}')
+    if args.export_samples > 0 and args.export_dataset > 0:
+        real_split = getattr(args, 'eval_real_split', 'train')
+        real_dir = parent_path / f'exports/{args.dataset}/dataset_{real_split}'
+        fake_dir = parent_path / f'exports/{model_name}'
+        print(f'\n{"="*50}')
+        print('Computing FID, IS & Precision/Recall...')
+        print(f'  Real (reference): {real_dir}')
+        print(f'  Fake (generated): {fake_dir}')
+        print(f'{"="*50}')
+
+        import datetime as _dt
+        _ts = _dt.datetime.now().strftime('%Y%m%d-%H%M%S')
+        if args.train == 0 and getattr(args, 'load_model', ''):
+            _model_stem = Path(args.load_model).stem
+            _tag = f'eval_fedavg_{args.dataset}_{_model_stem}_{_ts}.log'
+        else:
+            _tag = (f'eval_fedavg_{args.dataset}_R[{args.rounds}]_K[{args.num_users}]'
+                    f'_E[{args.local_ep}]_B[{args.local_bs}]_{_ts}.log')
+        _eval_log_dir = parent_path / 'results' / 'eval_logs'
+        _experiment_meta = {
+            'Method': 'fedavg',
+            'Load model': getattr(args, 'load_model', '') or '(none)',
+            'Data dist.': 'IID' if getattr(args, 'iid', 0) else 'Non-IID',
+            'Partition': getattr(args, 'partition', '') or '(default)',
+            'Client mode': 'Homogeneous',
+        }
+        perform_evaluation(real_path=str(real_dir), fake_path=str(fake_dir),
+                           num_samples=min(
+                               int(getattr(args, 'eval_num_samples', 30000)),
+                               args.export_samples,
+                               args.export_dataset,
+                           ),
+                           eval_log_dir=str(_eval_log_dir), config_tag=_tag,
+                           batch_size=getattr(args, 'eval_batch_size', 256),
+                           compute_is=bool(getattr(args, 'compute_is', 1)),
+                           experiment_meta=_experiment_meta)
     if args.show_samples:
         show_samples(diffuser, is_conditional, global_model, train_dataset, args.time_steps, image_size,
                      channels, use_ddim=bool(getattr(args, 'use_ddim', 1)),

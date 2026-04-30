@@ -173,6 +173,37 @@ def _set_lora_pair_(module: LoRAConv2d, B: torch.Tensor, A: torch.Tensor) -> Non
     module.scaling = module.alpha / rank if rank > 0 else 0.0
 
 
+def _set_lora_linear_pair_(module: LoRALinear, B: torch.Tensor, A: torch.Tensor) -> None:
+    """Safely set one LoRA pair on a LoRALinear module and sync rank/scaling."""
+    if not isinstance(module, LoRALinear):
+        raise TypeError(f"Expected LoRALinear, got {type(module)}")
+    if B.ndim != 2 or A.ndim != 2:
+        raise ValueError(f"LoRA factors must be 2D, got B={tuple(B.shape)}, A={tuple(A.shape)}")
+    if B.shape[1] != A.shape[0]:
+        raise ValueError(f"Rank mismatch: B={tuple(B.shape)}, A={tuple(A.shape)}")
+    if B.shape[0] != module.out_features:
+        raise ValueError(f"B out dim mismatch: expected {module.out_features}, got {B.shape[0]}")
+    if A.shape[1] != module.in_features:
+        raise ValueError(f"A in dim mismatch: expected {module.in_features}, got {A.shape[1]}")
+
+    device = next(module.parameters()).device
+    dtype = module.lora_A.dtype
+    B = B.detach().to(device=device, dtype=dtype).clone()
+    A = A.detach().to(device=device, dtype=dtype).clone()
+    rank = int(B.shape[1])
+
+    if tuple(module.lora_B.shape) != tuple(B.shape):
+        module.lora_B = nn.Parameter(torch.empty_like(B), requires_grad=True)
+    if tuple(module.lora_A.shape) != tuple(A.shape):
+        module.lora_A = nn.Parameter(torch.empty_like(A), requires_grad=True)
+
+    module.lora_B.data.copy_(B)
+    module.lora_A.data.copy_(A)
+
+    module.rank = rank
+    module.scaling = module.alpha / rank if rank > 0 else 0.0
+
+
 # ============================================================
 # Injected Attention Module (replaces to_qkv with separate Q/K/V + LoRA)
 # ============================================================
@@ -446,6 +477,15 @@ def inject_lora_into_unet(
     Returns:
         Modified model with LoRA injected (original model is modified in-place)
     """
+    if not hasattr(model, 'downs') or not hasattr(model, 'ups'):
+        return inject_lora_into_diffusers_unet(
+            model,
+            rank=rank,
+            alpha=alpha,
+            dropout=dropout,
+            target_layers=target_layers,
+        )
+
     model_device = next(model.parameters()).device
     effective_alpha = resolve_lora_alpha(rank, alpha)
     lora_config = {}  # Track injected modules for later factor extraction
@@ -509,6 +549,64 @@ def inject_lora_into_unet(
     print(f'[LoRA] Injected LoRA (rank={rank}, alpha={effective_alpha}, scaling={effective_alpha / rank if rank > 0 else 0.0}) into {len(lora_config)} modules')
     count_lora_params(model)
     
+    return model
+
+
+def _is_lora_wrapped(module):
+    return isinstance(module, (LoRAConv2d, LoRALinear, LoRAInjectedAttention, LoRAInjectedLinearAttention))
+
+
+def _is_diffusers_lora_target(module_name: str, module: nn.Module, target_layers: str) -> bool:
+    name = module_name.lower()
+    if target_layers == 'all':
+        return isinstance(module, nn.Linear) or (
+            isinstance(module, nn.Conv2d) and module.kernel_size == (1, 1)
+        )
+    attention_tokens = (
+        'attn', 'attention', 'to_q', 'to_k', 'to_v', 'to_out',
+        'query', 'key', 'value', 'proj_attn',
+    )
+    if not any(token in name for token in attention_tokens):
+        return False
+    return isinstance(module, nn.Linear) or (
+        isinstance(module, nn.Conv2d) and module.kernel_size == (1, 1)
+    )
+
+
+def inject_lora_into_diffusers_unet(
+    model: nn.Module,
+    rank: int = 8,
+    alpha: Optional[float] = None,
+    dropout: float = 0.0,
+    target_layers: str = 'attention',
+) -> nn.Module:
+    """Inject LoRA into attention-like Linear/1x1 Conv modules in a diffusers UNet."""
+    effective_alpha = resolve_lora_alpha(rank, alpha)
+    lora_config = {}
+
+    def _replace(parent: nn.Module, prefix=''):
+        for child_name, child in list(parent.named_children()):
+            full_name = f'{prefix}.{child_name}' if prefix else child_name
+            if _is_lora_wrapped(child):
+                continue
+            if _is_diffusers_lora_target(full_name, child, target_layers):
+                if isinstance(child, nn.Linear):
+                    setattr(parent, child_name, LoRALinear(child, rank, effective_alpha, dropout))
+                    lora_config[full_name] = {'type': 'linear', 'rank': rank}
+                elif isinstance(child, nn.Conv2d):
+                    setattr(parent, child_name, LoRAConv2d(child, rank, effective_alpha, dropout))
+                    lora_config[full_name] = {'type': 'conv2d', 'rank': rank}
+            else:
+                _replace(child, full_name)
+
+    _replace(model)
+    freeze_non_lora_params(model)
+    model._lora_config = lora_config
+    model._lora_rank = rank
+    model._lora_alpha = effective_alpha
+    print(f'[LoRA] Injected diffusers LoRA (rank={rank}, alpha={effective_alpha}, '
+          f'scaling={effective_alpha / rank if rank > 0 else 0.0}) into {len(lora_config)} modules')
+    count_lora_params(model)
     return model
 
 
@@ -635,6 +733,14 @@ def extract_all_lora_factors(model: nn.Module) -> List[Tuple[str, Dict, Dict]]:
                 B, A = child.get_lora_factors()
                 if B:  # Only add if there are actual LoRA factors
                     factors.append((full_name, dict(B), dict(A)))
+                continue
+            if isinstance(child, (LoRAConv2d, LoRALinear)):
+                factors.append((
+                    full_name,
+                    {'weight': child.lora_B.detach().cpu().clone()},
+                    {'weight': child.lora_A.detach().cpu().clone()},
+                ))
+                continue
             
             _scan(child, full_name)
     
@@ -659,6 +765,15 @@ def set_all_lora_factors(model: nn.Module,
             if full_name in factor_map and isinstance(child, (LoRAInjectedAttention, LoRAInjectedLinearAttention)):
                 B_dict, A_dict = factor_map[full_name]
                 child.set_lora_factors(B_dict, A_dict)
+                continue
+            if full_name in factor_map and isinstance(child, (LoRAConv2d, LoRALinear)):
+                B_dict, A_dict = factor_map[full_name]
+                if 'weight' in B_dict:
+                    if isinstance(child, LoRAConv2d):
+                        _set_lora_pair_(child, B_dict['weight'], A_dict['weight'])
+                    else:
+                        _set_lora_linear_pair_(child, B_dict['weight'], A_dict['weight'])
+                continue
             
             _apply(child, full_name)
     

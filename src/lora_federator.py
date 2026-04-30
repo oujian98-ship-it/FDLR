@@ -25,7 +25,6 @@ Usage:
 """
 
 import copy
-import csv
 import json
 import os
 import random
@@ -48,6 +47,7 @@ if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
 from diffuser import Diffuser
+from diffusers_backend import DiffusersDiffuser, DiffusersUNetWrapper
 from hetero_aggregation import HeteroLoRAAggregator, prefix_slice_distribution
 from hetero_aggregation import count_client_distribution_bytes, count_factor_list_bytes
 from lora import (
@@ -206,6 +206,12 @@ def build_base_model(args, device: str):
     Build and optionally load the base U-Net model (WITHOUT LoRA injection).
     LoRA injection happens later via inject_lora_into_unet().
     """
+    model_backend = getattr(args, 'model_backend', 'custom')
+    if model_backend == 'diffusers':
+        model_id = getattr(args, 'hf_model_id', 'google/ddpm-cifar10-32')
+        print(f'[Model] diffusers backend: {model_id}')
+        return DiffusersUNetWrapper(model_id=model_id).to(device)
+
     is_conditional = args.conditional == 1
     channels = args.num_channels
     image_size = args.image_size
@@ -254,6 +260,15 @@ def build_base_model(args, device: str):
     return model.to(device)
 
 
+def build_diffuser(args):
+    if getattr(args, 'model_backend', 'custom') == 'diffusers':
+        return DiffusersDiffuser(
+            model_id=getattr(args, 'hf_model_id', 'google/ddpm-cifar10-32'),
+            time_steps=int(args.time_steps),
+        )
+    return Diffuser(int(args.time_steps))
+
+
 def save_lora_checkpoint(model, path: Path, round_num: int = 0):
     """Save a complete checkpoint (base + LoRA params)."""
     # Save full model for sampling/inference
@@ -278,6 +293,8 @@ def save_experiment_protocol(result_folder: Path, args, data_stats, num_params, 
     protocol = {
         "protocol_name": "FedPhD-protocol-aligned FDLR",
         "dataset": args.dataset,
+        "model_backend": getattr(args, "model_backend", "custom"),
+        "hf_model_id": getattr(args, "hf_model_id", ""),
         "partition": getattr(args, "partition", ""),
         "num_users": args.num_users,
         "frac": args.frac,
@@ -297,6 +314,9 @@ def save_experiment_protocol(result_folder: Path, args, data_stats, num_params, 
         "compute_is": getattr(args, "compute_is", 1),
         "eval_real_split": getattr(args, "eval_real_split", "train"),
         "data_range": getattr(args, "data_range", "minus1_1"),
+        "resume_model": getattr(args, "resume_model", ""),
+        "start_round": getattr(args, "start_round", 0),
+        "cache_clients": getattr(args, "cache_clients", 0),
         "lora_ranks": getattr(args, "lora_ranks", ""),
         "global_lora_rank": getattr(args, "global_lora_rank", None),
         "lora_alpha_mode": getattr(args, "lora_alpha_mode", "rank"),
@@ -319,6 +339,16 @@ def save_experiment_protocol(result_folder: Path, args, data_stats, num_params, 
     print(f"Saved FedPhD protocol config: {path}")
 
 
+def cleanup_fixed_result_folder(result_folder: Path):
+    """Remove generated artifacts for the same fixed experiment name before a new run."""
+    if not result_folder.exists():
+        return
+    for pattern in ('*.pth', '*.metadata.pt', '*.json', '*.csv', '*.log'):
+        for path in result_folder.glob(pattern):
+            if path.is_file():
+                path.unlink()
+
+
 def run_training(args):
     """Main LoRA federated training loop."""
     start_time = time.time()
@@ -332,6 +362,9 @@ def run_training(args):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    if bool(getattr(args, 'disable_cudnn', 0)):
+        torch.backends.cudnn.enabled = False
+        print('[Info] cuDNN disabled for this run.')
 
     exp_details(args)
 
@@ -412,13 +445,32 @@ def run_training(args):
             target_layers=getattr(args, 'lora_target_layers', 'attention'),
         )
 
+    resume_factors = None
+    resume_model = getattr(args, 'resume_model', '')
+    if resume_model:
+        resume_path = parent_path / resume_model
+        if not resume_path.exists():
+            raise FileNotFoundError(f'--resume_model not found: {resume_path}')
+        print(f'[Resume] Loading LoRA factors from {resume_path}')
+        resume_checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
+        if isinstance(resume_checkpoint, dict):
+            raise ValueError('--resume_model should be a full LoRA model checkpoint, not a state_dict.')
+        resume_factors = extract_all_lora_factors(resume_checkpoint)
+        if not resume_factors:
+            raise ValueError(f'No LoRA factors found in resume checkpoint: {resume_path}')
+        set_all_lora_factors(server_model, resume_factors)
+        del resume_checkpoint
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        print(f'[Resume] Applied {len(resume_factors)} LoRA layers to server model.')
+
     num_params = sum(p.numel() for p in server_model.parameters())
     lora_params = sum(p.numel() for p in server_model.parameters() if p.requires_grad)
     print(f'\nServer model: {num_params:,} total params, {lora_params:,} global LoRA trainable '
           f'({100*lora_params/num_params:.2f}%)')
 
     # ---- Initialize diffuser ----
-    diffuser = Diffuser(int(args.time_steps))
+    diffuser = build_diffuser(args)
 
     # ---- Heterogeneous rank configuration ----
     print(f'\nClient LoRA rank config:')
@@ -442,7 +494,7 @@ def run_training(args):
 
     # Initialize client LoRA factors from the same server global subspace, even in round 0.
     # This is necessary for nested prefix distribution to be true from the beginning.
-    init_factors = extract_all_lora_factors(server_model)
+    init_factors = resume_factors if resume_factors is not None else extract_all_lora_factors(server_model)
     B_init, A_init = factors_list_to_nested_dict(init_factors)
     if bool(getattr(args, 'use_prefix_init', 1)):
         aggregator._last_distribution = prefix_slice_distribution(B_init, A_init, client_rank_map)
@@ -450,20 +502,13 @@ def run_training(args):
         aggregator._last_distribution = {}
 
     # ---- Setup output directories ----
-    _lr = getattr(args, 'lora_rank', 8)
-    model_name = (
-        f'lora_{args.dataset}'
-        f'_R[{args.rounds}]'
-        f'_K[{args.num_users}]'
-        f'_r[{_lr}g{global_rank}]'
-        f'_E[{args.local_ep}]'
-        f'_B[{args.local_bs}]'
-        f'_T[{int(args.time_steps)}]'
-        f'_I[{args.iid},{args.unequal}]'
-    )
-
-    result_folder = parent_path / f'results/{time.strftime("%Y%m%d-%H%M%S")}_{model_name}'
+    final_model_name = f'flora_model_{args.dataset}_R[{args.rounds}]_K[{args.num_users}]_E[{args.local_ep}]'
+    model_name = final_model_name
+    result_folder = parent_path / 'results' / final_model_name
     os.makedirs(result_folder, exist_ok=True)
+    is_resume_run = bool(getattr(args, 'resume_model', '')) or int(getattr(args, 'start_round', 0)) > 0
+    if not is_resume_run:
+        cleanup_fixed_result_folder(result_folder)
     os.makedirs(parent_path / 'models', exist_ok=True)
     save_experiment_protocol(result_folder, args, data_stats, num_params, lora_params)
 
@@ -472,10 +517,16 @@ def run_training(args):
     comm_stats_per_round = []
 
     # Create clients (lazy creation on first use, then cached)
+    cache_clients = bool(getattr(args, 'cache_clients', 0))
     client_cache = {}
     agg_round_num = 0
 
-    for round_idx in tqdm(range(args.rounds), desc='Federated Rounds'):
+    start_round = int(getattr(args, 'start_round', 0))
+    if start_round:
+        print(f'[Resume] Continuing from round {start_round} to {args.rounds - 1}')
+        agg_round_num = start_round
+
+    for round_idx in tqdm(range(start_round, args.rounds), desc='Federated Rounds'):
         print(f'\n{"="*60}')
         print(f'Global Training Round [{round_idx}]/[{args.rounds-1}]')
         print(f'{"="*60}')
@@ -489,15 +540,18 @@ def run_training(args):
         local_losses = []
         data_sizes = {}
         active_ranks = {}
+        client_trainable_counts = {}
 
         for i, client_id in enumerate(user_indices):
             print(f'\n--- Client {client_id} ---')
             
             # Create or retrieve cached client
-            if client_id not in client_cache:
+            if cache_clients and client_id in client_cache:
+                client = client_cache[client_id]
+            else:
                 client_rank = client_rank_map.get(client_id, 8)
                 client_alpha = resolve_lora_alpha(args, client_rank)
-                client_cache[client_id] = LoRAClient(
+                client = LoRAClient(
                     args=args,
                     dataset=train_dataset,
                     base_model=base_model_clean,  # clean model; LoRAClient injects local rank itself
@@ -507,8 +561,8 @@ def run_training(args):
                     lora_rank=client_rank,
                     lora_alpha=client_alpha,
                 )
-            
-            client = client_cache[client_id]
+                if cache_clients:
+                    client_cache[client_id] = client
 
             # Receive server prefix distribution. Round 0 also receives the initial prefix distribution.
             server_upd = getattr(aggregator, '_last_distribution', {}).get(client_id)
@@ -529,6 +583,11 @@ def run_training(args):
             
             data_sizes[client_id] = len(client_groups[client_id])
             active_ranks[client_id] = client_rank_map.get(client_id, 8)
+            client_trainable_counts[client_id] = int(client.get_trainable_param_count())
+            if not cache_clients:
+                del client
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
         # ---- Server-side aggregation ----
         agg_t0 = time.time()
@@ -564,7 +623,7 @@ def run_training(args):
         agg_result['stats']['server_aggregation_time_sec'] = float(agg_time)
         agg_result['stats']['round_wall_clock_sec'] = float(round_wall)
         agg_result['stats']['client_trainable_params'] = {
-            str(cid): int(client_cache[cid].get_trainable_param_count())
+            str(cid): client_trainable_counts.get(cid, 0)
             for cid in user_indices
         }
         comm_stats_per_round.append(agg_result['stats'])
@@ -590,7 +649,7 @@ def run_training(args):
 
         # ---- Save checkpoints ----
         if round_idx % max(1, args.rounds // 5) == 0 or round_idx == args.rounds - 1:
-            ckpt_path = result_folder / f'{model_name}_R[{round_idx}].pth'
+            ckpt_path = result_folder / f'{final_model_name}_round[{round_idx}].pth'
             save_lora_checkpoint(server_model, ckpt_path, round_idx)
             save_lora_metadata(
                 ckpt_path.with_suffix('.metadata.pt'),
@@ -614,7 +673,7 @@ def run_training(args):
             )
 
     # ---- Final save ----
-    final_path = result_folder / f'{model_name}.pth'
+    final_path = result_folder / f'{final_model_name}.pth'
     save_lora_checkpoint(server_model, final_path)
     save_lora_metadata(
         final_path.with_suffix('.metadata.pt'),
@@ -622,54 +681,56 @@ def run_training(args):
     )
     
     # Save to project root with hyperparam tags
-    _lr = getattr(args, 'lora_rank', 8)
-    final_model_name = f'flora_model_{args.dataset}_R[{args.rounds}]_K[{args.num_users}]_E[{args.local_ep}]'
     final_model_path = parent_path / f'{final_model_name}.pth'
+    root_metadata_path = final_model_path.with_suffix('.metadata.pt')
+    if root_metadata_path.exists():
+        root_metadata_path.unlink()
     save_lora_checkpoint(server_model, final_model_path)
-    save_lora_metadata(
-        final_model_path.with_suffix('.metadata.pt'),
-        server_model, args, client_rank_map, comm_stats_per_round, args.rounds - 1
-    )
     print(f'\nFinal model saved: {final_model_path}')
 
-    # ---- Export loss CSV ----
-    csv_path = result_folder / f'{model_name}.csv'
-    with open(csv_path, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            'round',
-            'loss',
-            'upload_kb',
-            'download_kb',
-            'server_aggregation_time_sec',
-            'round_wall_clock_sec',
-        ])
-        for idx, (loss, stats) in enumerate(zip(train_losses, comm_stats_per_round)):
-            writer.writerow([
-                idx,
-                f'{loss:.6f}',
-                stats.get('upload_bytes', 0) / 1024,
-                stats.get('download_bytes', 0) / 1024,
-                stats.get('server_aggregation_time_sec', 0.0),
-                stats.get('round_wall_clock_sec', 0.0),
-            ])
-        writer.writerow(['runtime', time.time() - start_time])
-
+    # ---- Export training/communication log ----
     central_interval = int(getattr(args, 'central_agg_interval', 5))
-    window_csv_path = result_folder / f'{model_name}_central_window_comm.csv'
-    with open(window_csv_path, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(['window_start_round', 'upload_MB', 'download_MB', 'total_MB'])
+    eval_log_dir = parent_path / 'results' / 'eval_logs'
+    eval_log_dir.mkdir(parents=True, exist_ok=True)
+    log_ts = time.strftime('%Y%m%d-%H%M%S')
+    train_log_path = eval_log_dir / f'{final_model_name}_train_{log_ts}.log'
+    with open(train_log_path, 'w', encoding='utf-8') as f:
+        f.write(f'Training Log  {log_ts}\n')
+        f.write('=' * 60 + '\n\n')
+        f.write(f'Model name    : {final_model_name}\n')
+        f.write(f'Dataset       : {args.dataset}\n')
+        f.write(f'Rounds        : {args.rounds}\n')
+        f.write(f'Clients       : {args.num_users}\n')
+        f.write(f'Local epochs  : {args.local_ep}\n')
+        f.write(f'Local batch   : {args.local_bs}\n')
+        f.write(f'Results folder: {result_folder}\n')
+        f.write(f'Root model    : {final_model_path}\n')
+        f.write(f'Result model  : {final_path}\n\n')
+        f.write('[Per-round]\n')
+        f.write('round\tloss\tupload_kb\tdownload_kb\tserver_aggregation_time_sec\tround_wall_clock_sec\n')
+        for idx, (loss, stats) in enumerate(zip(train_losses, comm_stats_per_round)):
+            round_num = start_round + idx
+            f.write(
+                f'{round_num}\t'
+                f'{loss:.6f}\t'
+                f'{stats.get("upload_bytes", 0) / 1024:.6f}\t'
+                f'{stats.get("download_bytes", 0) / 1024:.6f}\t'
+                f'{stats.get("server_aggregation_time_sec", 0.0):.6f}\t'
+                f'{stats.get("round_wall_clock_sec", 0.0):.6f}\n'
+            )
+        f.write(f'\nruntime_sec\t{time.time() - start_time:.6f}\n\n')
+        f.write('[Central-window communication]\n')
+        f.write('window_start_round\tupload_MB\tdownload_MB\ttotal_MB\n')
         for start in range(0, len(comm_stats_per_round), central_interval):
             chunk = comm_stats_per_round[start:start + central_interval]
             up = sum(s.get('upload_bytes', 0) for s in chunk)
             down = sum(s.get('download_bytes', 0) for s in chunk)
-            writer.writerow([
-                start,
-                up / (1024 * 1024),
-                down / (1024 * 1024),
-                (up + down) / (1024 * 1024),
-            ])
+            f.write(
+                f'{start_round + start}\t'
+                f'{up / (1024 * 1024):.6f}\t'
+                f'{down / (1024 * 1024):.6f}\t'
+                f'{(up + down) / (1024 * 1024):.6f}\n'
+            )
 
     print(f'\n{"="*60}')
     print(f'Training Complete!')
@@ -685,10 +746,10 @@ def run_training(args):
     print(f'  Total    : {total_total / (1024*1024):.2f} MB')
     
     print(f'\nTotal runtime: {time.time()-start_time:.1f}s')
-    print(f'Model saved to: {final_path}')
+    print(f'Root model: {final_model_path}')
+    print(f'Result model: {final_path}')
     print(f'Results folder: {result_folder}')
-    print(f'Loss CSV: {csv_path}')
-    print(f'Central-window communication CSV: {window_csv_path}')
+    print(f'Training log: {train_log_path}')
     print(f'{"="*60}')
 
 
@@ -732,10 +793,11 @@ def run_inference(args):
         inject_lora_into_unet(model, rank=lora_rank,
                               alpha=resolve_lora_alpha(args, lora_rank),
                               target_layers='attention')
+        model = model.to(device)
         model.eval()
 
     # ---- Diffuser ----
-    diffuser = Diffuser(int(args.time_steps))
+    diffuser = build_diffuser(args)
 
     # Derive export folder name from loaded model (or default)
     if args.load_model:
@@ -788,10 +850,26 @@ def run_inference(args):
         _ts = _dt.datetime.now().strftime('%Y%m%d-%H%M%S')
         _lora_rank = getattr(args, 'lora_rank', 8)
         _global_rank = getattr(args, 'global_lora_rank', _lora_rank)
-        _tag = (f'{args.dataset}_R[{args.rounds}]_K[{args.num_users}]'
-                f'_r[{_lora_rank}g{_global_rank}]_E[{args.local_ep}]'
-                f'_B[{args.local_bs}]_{_ts}.log')
+        _agg_mode = getattr(args, 'agg_mode', 'fdlr')
+        if getattr(args, 'load_model', ''):
+            _model_stem = Path(args.load_model).stem
+            _tag = f'eval_lora_{args.dataset}_{_model_stem}_{_agg_mode}_{_ts}.log'
+        else:
+            _tag = (f'eval_lora_{args.dataset}_R[{args.rounds}]_K[{args.num_users}]'
+                    f'_r[{_lora_rank}g{_global_rank}]_E[{args.local_ep}]'
+                    f'_B[{args.local_bs}]_{_agg_mode}_{_ts}.log')
         _eval_log_dir = parent_path / 'results' / 'eval_logs'
+        _lora_ranks = getattr(args, 'lora_ranks', '')
+        _client_mode = 'Heterogeneous' if _lora_ranks else 'Homogeneous'
+        _experiment_meta = {
+            'Method': 'lora',
+            'Load model': getattr(args, 'load_model', '') or '(none)',
+            'Agg mode': getattr(args, 'agg_mode', 'fdlr'),
+            'Data dist.': 'IID' if getattr(args, 'iid', 0) else 'Non-IID',
+            'Partition': getattr(args, 'partition', '') or '(default)',
+            'Client mode': _client_mode,
+            'LoRA ranks': _lora_ranks or str(getattr(args, 'lora_rank', 8)),
+        }
 
         perform_evaluation(real_path=str(real_dir), fake_path=str(fake_dir),
                            num_samples=min(
@@ -801,7 +879,8 @@ def run_inference(args):
                            ),
                            eval_log_dir=str(_eval_log_dir), config_tag=_tag,
                            batch_size=getattr(args, 'eval_batch_size', 256),
-                           compute_is=bool(getattr(args, 'compute_is', 1)))
+                           compute_is=bool(getattr(args, 'compute_is', 1)),
+                           experiment_meta=_experiment_meta)
 
 
 def add_lora_arguments(parser):
@@ -850,6 +929,12 @@ def main(external_args=None):
     # Diffusion args
     p.add_argument('--train', type=int, default=1)
     p.add_argument('--load_model', type=str, default='')
+    p.add_argument('--resume_model', type=str, default='',
+                   help='Full LoRA checkpoint to resume from; keeps --load_model as clean base.')
+    p.add_argument('--start_round', type=int, default=0,
+                   help='First round index to run when resuming, e.g. 19 after R[18].')
+    p.add_argument('--cache_clients', type=int, default=0,
+                   help='Cache client models across rounds. 0 saves memory and is recommended for long runs.')
     p.add_argument('--time_steps', type=float, default=1000)
     p.add_argument('--conditional', type=int, default=0)
     p.add_argument('--lr', type=float, default=1e-4)
@@ -858,6 +943,13 @@ def main(external_args=None):
 
     # Data args
     p.add_argument('--dataset', type=str, default='fmnist')
+    p.add_argument('--model_backend', type=str, default='custom',
+                   choices=['custom', 'diffusers'],
+                   help='custom uses src/unet.py; diffusers uses Hugging Face UNet2DModel.')
+    p.add_argument('--hf_model_id', type=str, default='google/ddpm-cifar10-32',
+                   help='Hugging Face model id for --model_backend=diffusers.')
+    p.add_argument('--disable_cudnn', type=int, default=0,
+                   help='Disable cuDNN kernels. Useful for CUDNN_STATUS_INTERNAL_ERROR workarounds.')
     p.add_argument('--data_root', type=str, default='',
                     help='Custom data root path (overrides default). '
                          'E.g., --data_root=D:\\\\data\\\\CelebA')

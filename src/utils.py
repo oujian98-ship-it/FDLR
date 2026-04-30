@@ -46,7 +46,7 @@ def create_precision_recall_config(path_real='', path_fake='', batch_size=50, k=
 
 def perform_evaluation(real_path, fake_path, dataset_to_export=None, num_samples=100,
                        eval_log_dir=None, config_tag='', batch_size=256,
-                       compute_is=True):
+                       compute_is=True, experiment_meta=None):
     """Run FID + IS + Precision/Recall evaluation and optionally log results."""
     import datetime
 
@@ -62,11 +62,24 @@ def perform_evaluation(real_path, fake_path, dataset_to_export=None, num_samples
     _pr_result = calculate_precision_recall(precision_recall_config)
     _is_result = None
     if compute_is:
+        print('\nComputing Inception Score...')
         _is_result = calculate_inception_score(
             image_folder=fake_path,
             num_samples=num_samples,
             batch_size=batch_size,
         )
+        print(f'Inception Score: {_is_result[0]} +/- {_is_result[1]}')
+    else:
+        print('\nInception Score: skipped (compute_is=False)')
+
+    print('\nEvaluation summary:')
+    print(f'  FID       : {_fid_result}')
+    if _is_result is not None:
+        print(f'  IS        : {_is_result[0]} +/- {_is_result[1]}')
+    else:
+        print('  IS        : skipped')
+    print(f'  Precision : {_pr_result[0]}')
+    print(f'  Recall    : {_pr_result[1]}')
 
     # ---- Save evaluation log ----
     if eval_log_dir:
@@ -82,6 +95,9 @@ def perform_evaluation(real_path, fake_path, dataset_to_export=None, num_samples
             f.write(f'Evaluation Log  {ts}\n')
             f.write(f'{"="*60}\n\n')
             f.write(f'Tag         : {config_tag}\n')
+            if experiment_meta:
+                for key, value in experiment_meta.items():
+                    f.write(f'{key:<12}: {value}\n')
             f.write(f'Real path   : {real_path}\n')
             f.write(f'Fake path   : {fake_path}\n')
             f.write(f'Num samples : {num_samples}\n\n')

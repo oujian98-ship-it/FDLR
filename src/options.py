@@ -21,7 +21,7 @@ def args_parser():
                         help='Retrain the model instead of loading the checkpointed version')
     parser.add_argument('--load_model', type=str, default='',
                         help='The path of the model to load')
-    parser.add_argument('--time_steps', type=float, default=1000, help='Number of timestamps (default: 1000)')
+    parser.add_argument('--time_steps', type=int, default=1000, help='Number of timestamps (default: 1000)')
     parser.add_argument('--conditional', type=int, default=0, help='Whether the model is class labeled (1) or not (0)')
     parser.add_argument('--lr', type=float, default=1e-4, help='learning rate')
     parser.add_argument('--momentum', type=float, default=0.5, help='SGD momentum (default: 0.5)')
@@ -33,6 +33,12 @@ def args_parser():
 
     # data arguments
     parser.add_argument('--dataset', type=str, default='fmnist', help="name of dataset")
+    parser.add_argument('--model_backend', type=str, default='custom', choices=['custom', 'diffusers'],
+                        help='custom src/unet.py backend or Hugging Face diffusers backend')
+    parser.add_argument('--hf_model_id', type=str, default='google/ddpm-cifar10-32',
+                        help='Hugging Face model id for diffusers backend')
+    parser.add_argument('--disable_cudnn', type=int, default=0,
+                        help='disable cuDNN kernels for CUDA workaround')
     parser.add_argument('--data_root', type=str, default='',
                         help='custom dataset root path, e.g. D:\\data\\cifar-10-python')
     parser.add_argument('--download_dataset', type=int, default=0,
