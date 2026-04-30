@@ -44,9 +44,35 @@ def create_precision_recall_config(path_real='', path_fake='', batch_size=50, k=
                      fname_precalc=fname_precalc, toy=toy)
 
 
+def calculate_model_complexity(model, input_res=(3, 32, 32)):
+    """Estimate trainable parameters and MACs (FLOPs)."""
+    import torch.nn as nn
+    if model is None:
+        return 0, 0, 0
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    macs = 0
+    def _estimate_macs(module, current_res):
+        nonlocal macs
+        c, h, w = current_res
+        for m in module.children():
+            if isinstance(m, nn.Conv2d):
+                macs += m.weight.numel() * h * w
+            elif isinstance(m, nn.Linear):
+                macs += m.weight.numel()
+            if len(list(m.children())) > 0:
+                _estimate_macs(m, current_res)
+    try:
+        _estimate_macs(model, input_res)
+    except Exception:
+        pass
+    return trainable_params, total_params, macs
+
+
 def perform_evaluation(real_path, fake_path, dataset_to_export=None, num_samples=100,
                        eval_log_dir=None, config_tag='', batch_size=256,
-                       compute_is=True, experiment_meta=None):
+                       compute_is=True, experiment_meta=None,
+                       model=None, image_size=32):
     """Run FID + IS + Precision/Recall evaluation and optionally log results."""
     import datetime
 
@@ -72,6 +98,9 @@ def perform_evaluation(real_path, fake_path, dataset_to_export=None, num_samples
     else:
         print('\nInception Score: skipped (compute_is=False)')
 
+    # ---- Calculate model complexity ----
+    trainable_params, total_params, macs = calculate_model_complexity(model, input_res=(3, image_size, image_size))
+
     print('\nEvaluation summary:')
     print(f'  FID       : {_fid_result}')
     if _is_result is not None:
@@ -80,6 +109,9 @@ def perform_evaluation(real_path, fake_path, dataset_to_export=None, num_samples
         print('  IS        : skipped')
     print(f'  Precision : {_pr_result[0]}')
     print(f'  Recall    : {_pr_result[1]}')
+    print(f'  Trainable Params: {trainable_params:,}')
+    print(f'  Total Params: {total_params:,}')
+    print(f'  Estimated MACs: {macs/1e9:.3f} G')
 
     # ---- Save evaluation log ----
     if eval_log_dir:
@@ -91,20 +123,30 @@ def perform_evaluation(real_path, fake_path, dataset_to_export=None, num_samples
         else:
             log_name = f'{config_tag}_{ts}.log' if config_tag else f'eval_{ts}.log'
         log_path = eval_log_dir / log_name
+        import sys
+        curr_command = " ".join(sys.argv)
+        
         with open(log_path, 'w', encoding='utf-8') as f:
             f.write(f'Evaluation Log  {ts}\n')
             f.write(f'{"="*60}\n\n')
+            f.write(f'Run Command : {curr_command}\n')
             f.write(f'Tag         : {config_tag}\n')
             if experiment_meta:
                 for key, value in experiment_meta.items():
-                    f.write(f'{key:<12}: {value}\n')
-            f.write(f'Real path   : {real_path}\n')
-            f.write(f'Fake path   : {fake_path}\n')
-            f.write(f'Num samples : {num_samples}\n\n')
-            f.write(f'Batch size  : {batch_size}\n\n')
-            f.write(f'FID Score   : {_fid_result}\n')
-            f.write(f'IS Score    : {_is_result}\n')
+                    f.write(f'{key:<16}: {value}\n')
+            f.write(f'Params (Trainable): {trainable_params:,}\n')
+            f.write(f'Params (Total): {total_params:,}\n')
+            f.write(f'MACs (Est.): {macs/1e9:.3f} G\n')
+            f.write(f'Real path       : {real_path}\n')
+            f.write(f'Fake path       : {fake_path}\n')
+            f.write(f'Num samples     : {num_samples}\n')
+            f.write(f'Batch size      : {batch_size}\n\n')
+            
+            f.write(f'{"-"*30}\n')
+            f.write(f'FID Score       : {_fid_result}\n')
+            f.write(f'IS Score        : {_is_result}\n')
             f.write(f'Precision/Recall: {_pr_result}\n')
+            f.write(f'{"-"*30}\n')
         print(f'\n[Evaluation log saved] {log_path}')
 
     return {

@@ -381,8 +381,18 @@ def main(args):
             _tag = (f'eval_fedavg_{args.dataset}_R[{args.rounds}]_K[{args.num_users}]'
                     f'_E[{args.local_ep}]_B[{args.local_bs}]_{_ts}.log')
         _eval_log_dir = parent_path / 'results' / 'eval_logs'
+        import sys
+        _curr_cmd = " ".join(sys.argv)
+        # Calculate total communication from num_params_shared if training was just done
+        _comm_vol = "N/A"
+        if 'num_params_shared' in locals() and num_params_shared:
+            _total_params = sum(num_params_shared)
+            # Assuming 4 bytes per parameter (float32)
+            _comm_vol = f"{_total_params * 4 / (1024*1024):.2f} MB"
+
         _experiment_meta = {
             'Method': 'fedavg',
+            'Communication': _comm_vol,
             'Load model': getattr(args, 'load_model', '') or '(none)',
             'Data dist.': 'IID' if getattr(args, 'iid', 0) else 'Non-IID',
             'Partition': getattr(args, 'partition', '') or '(default)',
@@ -397,7 +407,8 @@ def main(args):
                            eval_log_dir=str(_eval_log_dir), config_tag=_tag,
                            batch_size=getattr(args, 'eval_batch_size', 256),
                            compute_is=bool(getattr(args, 'compute_is', 1)),
-                           experiment_meta=_experiment_meta)
+                           experiment_meta=_experiment_meta,
+                           model=global_model, image_size=image_size)
     if args.show_samples:
         show_samples(diffuser, is_conditional, global_model, train_dataset, args.time_steps, image_size,
                      channels, use_ddim=bool(getattr(args, 'use_ddim', 1)),

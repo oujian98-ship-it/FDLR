@@ -285,6 +285,7 @@ def save_lora_metadata(path: Path, model, args, client_rank_map, comm_stats, rou
         'client_ranks': dict(client_rank_map),
         'communication_stats': list(comm_stats),
         'experiment_args': vars(args) if hasattr(args, '__dict__') else {},
+        'command_line': " ".join(sys.argv),
     }, path)
     print(f'Saved LoRA metadata: {path}')
 
@@ -861,8 +862,24 @@ def run_inference(args):
         _eval_log_dir = parent_path / 'results' / 'eval_logs'
         _lora_ranks = getattr(args, 'lora_ranks', '')
         _client_mode = 'Heterogeneous' if _lora_ranks else 'Homogeneous'
+        import sys
+        _curr_cmd = " ".join(sys.argv)
+        _comm_vol = "N/A"
+        if args.load_model:
+            _meta_path = Path(args.load_model).with_suffix('.metadata.pt')
+            if _meta_path.exists():
+                try:
+                    _meta = torch.load(_meta_path, map_location='cpu')
+                    _stats = _meta.get('communication_stats', [])
+                    if _stats:
+                        _total_bytes = sum(s.get('upload_bytes', 0) + s.get('download_bytes', 0) for s in _stats)
+                        _comm_vol = f"{_total_bytes / (1024*1024):.2f} MB"
+                except Exception:
+                    pass
+
         _experiment_meta = {
-            'Method': 'lora',
+            'Method': 'lora (FLoRA)',
+            'Communication': _comm_vol,
             'Load model': getattr(args, 'load_model', '') or '(none)',
             'Agg mode': getattr(args, 'agg_mode', 'fdlr'),
             'Data dist.': 'IID' if getattr(args, 'iid', 0) else 'Non-IID',
@@ -880,7 +897,8 @@ def run_inference(args):
                            eval_log_dir=str(_eval_log_dir), config_tag=_tag,
                            batch_size=getattr(args, 'eval_batch_size', 256),
                            compute_is=bool(getattr(args, 'compute_is', 1)),
-                           experiment_meta=_experiment_meta)
+                           experiment_meta=_experiment_meta,
+                           model=model, image_size=image_size)
 
 
 def add_lora_arguments(parser):
