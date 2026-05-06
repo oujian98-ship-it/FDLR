@@ -215,26 +215,42 @@ PRESETS = {
         'train': 1, 'auto_eval': 1,
     },
     # ---- 推理评估 (train=0) ----
-    'infer_celeba': {
-        'description': 'CelebA 推理: 生成图片 + FID评估',
+    # LoRA 推理
+    'infer_celeba_lora': {
+        'description': 'CelebA LoRA 推理: 生成图片 + FID评估',
         'method': 'lora', 'dataset': 'celeba',
         'train': 0,
         'load_model': 'flora_model_celeba_R[30]_K[5]_E[5].pth',
         'export_samples': 5000, 'export_dataset': 5000,
     },
-    'infer_fmnist': {
-        'description': 'FMNIST 推理: 生成图片 + FID评估',
+    'infer_fmnist_lora': {
+        'description': 'FMNIST LoRA 推理: 生成图片 + FID评估',
         'method': 'lora', 'dataset': 'fmnist',
         'train': 0,
         'load_model': 'flora_model_fmnist_R[15]_K[5]_E[5].pth',
         'export_samples': 5000, 'export_dataset': 5000,
     },
-    'infer_cifar10': {
-        'description': 'CIFAR10 推理: 生成图片 + FID评估',
+    'infer_cifar10_lora': {
+        'description': 'CIFAR10 LoRA 推理: 生成图片 + FID评估',
         'method': 'lora', 'dataset': 'cifar10',
         'train': 0,
         'load_model': 'flora_model_cifar10_R[2000]_K[20]_E[5].pth',
         'export_samples': 30000, 'export_dataset': 30000,
+    },
+    # FedAvg 推理
+    'infer_celeba_fedavg': {
+        'description': 'CelebA FedAvg 推理: 生成图片 + FID评估',
+        'method': 'fedavg', 'dataset': 'celeba',
+        'train': 0,
+        'load_model': 'fedavg_model_celeba_R[30]_K[5]_E[5].pth',
+        'export_samples': 5000, 'export_dataset': 5000,
+    },
+    'infer_fmnist_fedavg': {
+        'description': 'FMNIST FedAvg 推理: 生成图片 + FID评估',
+        'method': 'fedavg', 'dataset': 'fmnist',
+        'train': 0,
+        'load_model': 'fedavg_model_fmnist_R[15]_K[5]_E[5].pth',
+        'export_samples': 5000, 'export_dataset': 5000,
     },
 }
 
