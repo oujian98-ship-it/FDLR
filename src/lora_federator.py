@@ -751,7 +751,92 @@ def run_training(args):
     print(f'Result model: {final_path}')
     print(f'Results folder: {result_folder}')
     print(f'Training log: {train_log_path}')
+
+    # ---- Auto-eval after training (one-command train+evaluate) ----
+    if bool(getattr(args, 'auto_eval', 0)):
+        _run_auto_eval(args, final_path, result_folder, start_time)
+
     print(f'{"="*60}')
+
+
+def _run_auto_eval(args, trained_model_path: Path, result_folder: Path,
+                   train_start_time: float):
+    """Automatically export samples + compute FID/IS after training completes."""
+    import datetime as _dt
+    print(f'\n{"="*60}')
+    print('[Auto-Eval] Starting post-training evaluation...')
+    print(f'{"="*60}')
+
+    parent_path = Path(__file__).parent.parent
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    image_size = args.image_size
+    is_conditional = args.conditional == 1
+    channels = args.num_channels
+
+    # Load the trained model
+    print(f'[Auto-Eval] Loading trained model from {trained_model_path}')
+    model = torch.load(trained_model_path, map_location=torch.device(device),
+                       weights_only=False)
+    model = model.to(device).eval()
+    print(f'[Auto-Eval] Model loaded ({sum(p.numel() for p in model.parameters()):,} params)')
+
+    diffuser = build_diffuser(args)
+
+    # Export real dataset samples (reference for FID)
+    eval_samples = int(getattr(args, 'eval_num_samples', 5000))
+    real_split = getattr(args, 'eval_real_split', 'train')
+    real_dir = parent_path / f'results/auto_eval/{args.dataset}_real_{real_split}'
+    print(f'\n[Auto-Eval] Exporting {eval_samples} real ({real_split}) reference samples → {real_dir}')
+    export_dataset(real_dir, args.dataset, eval_samples, train=(real_split == 'train'),
+                   data_range=getattr(args, 'data_range', 'minus1_1'))
+
+    # Generate fake samples from trained model
+    fake_dir = parent_path / f'results/auto_eval/fake_{trained_model_path.stem}'
+    eval_bs = int(getattr(args, 'eval_batch_size', 256))
+    use_ddim_val = bool(getattr(args, 'use_ddim', 1))
+    ddim_steps_val = int(getattr(args, 'ddim_steps', 100))
+    print(f'\n[Auto-Eval] Generating {eval_samples} fake samples → {fake_dir}')
+    print(f'           batch={eval_bs}, DDIM={use_ddim_val}, steps={ddim_steps_val}')
+    export_samples(diffuser, fake_dir, is_conditional, model,
+                   int(args.time_steps), image_size, channels,
+                   args.num_classes, eval_samples,
+                   use_ddim=use_ddim_val, ddim_steps=ddim_steps_val,
+                   batch_size=eval_bs,
+                   data_range=getattr(args, 'data_range', 'minus1_1'))
+
+    # Compute FID / IS
+    print(f'\n[Auto-Eval] Computing FID, IS & Precision/Recall ...')
+    print(f'  Real: {real_dir}')
+    print(f'  Fake: {fake_dir}')
+    print(f'{"="*60}')
+
+    _ts = _dt.datetime.now().strftime('%Y%m%d-%H%M%S')
+    _agg_mode = getattr(args, 'agg_mode', 'fdlr')
+    _lora_ranks = getattr(args, 'lora_ranks', '')
+    _client_mode = 'Heterogeneous' if _lora_ranks else 'Homogeneous'
+    _tag = f'autoeval_{args.dataset}_{trained_model_path.stem}_{_agg_mode}_{_ts}.log'
+
+    _experiment_meta = {
+        'Method': 'lora (FLoRA)',
+        'Agg mode': _agg_mode,
+        'Data dist.': 'IID' if getattr(args, 'iid', 0) else 'Non-IID',
+        'Client mode': _client_mode,
+        'LoRA ranks': _lora_ranks or str(getattr(args, 'lora_rank', 8)),
+    }
+
+    perform_evaluation(
+        real_path=str(real_dir), fake_path=str(fake_dir),
+        num_samples=eval_samples, batch_size=eval_bs,
+        eval_log_dir=str(result_folder / 'eval_logs'),
+        config_tag=_tag,
+        compute_is=bool(getattr(args, 'compute_is', 1)),
+        experiment_meta=_experiment_meta,
+        model=None, image_size=args.image_size,
+    )
+
+
+    elapsed_total = time.time() - train_start_time
+    print(f'\n[Auto-Eval] Train + Eval complete! Total time: {elapsed_total:.1f}s')
 
 
 def run_inference(args):
@@ -1010,6 +1095,8 @@ def main(external_args=None):
     p.add_argument('--data_range', type=str, default='minus1_1',
                    choices=['minus1_1', '0_1'],
                    help='Training/sample tensor range. Use 0_1 for legacy model_cifar.pth compatibility.')
+    p.add_argument('--auto_eval', type=int, default=0,
+                   help='Auto-run FID/IS evaluation after training completes (1=yes, 0=no).')
 
     # Add LoRA-specific args
     add_lora_arguments(p)

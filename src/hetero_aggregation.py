@@ -65,89 +65,176 @@ def recover_true_updates(
     return true_deltas, layer_shapes
 
 
+def _extract_per_layer_ranks(
+    client_factors_list: List[Tuple[int, List[Tuple[str, Dict[str, torch.Tensor],
+                                                    Dict[str, torch.Tensor]]]]],
+) -> Dict[str, Dict[int, int]]:
+    """
+    Extract per-layer per-client rank from client LoRA factors.
+
+    For each layer_key (e.g., 'downs.0.2.fn_q'), determine the rank that
+    each client used at that layer by inspecting B matrix shape [out, rank].
+
+    Returns:
+        {layer_key: {client_id: lora_rank}}
+    """
+    per_layer_ranks = {}
+    for client_id, factors in client_factors_list:
+        for layer_name, B_dict, A_dict in factors:
+            for factor_key in B_dict:
+                full_key = f'{layer_name}_{factor_key}'
+                B = B_dict[factor_key]  # [out, rank]
+                r = B.shape[1]
+                if full_key not in per_layer_ranks:
+                    per_layer_ranks[full_key] = {}
+                per_layer_ranks[full_key][client_id] = r
+    return per_layer_ranks
+
+
 # ============================================================
-# Step 2: Rank-Corrected Aggregation Weights
+# Step 2: Rank-Corrected AggregationWeights (Per-Layer α_{i,l})
 # ============================================================
 
 def compute_aggregation_weights(
     data_sizes: Dict[int, int],
-    client_ranks: Dict[int, int],  # client_id -> rank used by this client
+    client_ranks: Dict[int, int],  # client_id -> rank used by this client (backward compat)
     rank_correction: bool = True,
     rank_beta: float = 0.5,
-) -> Dict[int, float]:
+    per_layer_ranks: Optional[Dict[str, Dict[int, int]]] = None,
+) -> Dict[str, Dict[int, float]]:
     """
-    Compute per-client aggregation weights with optional rank correction.
-    
-    α_i = n_i · η(r_i) / Σ_j n_j · η(r_j)
-    
+    Compute **per-layer** aggregation weights with optional rank correction.
+
+    Paper formula (Eq. for α_{i,l}^{(t)}):
+        α_{i,l} = n_i · η(r_{i,l}) / Σ_{j∈S_t} n_j · η(r_{j,l})
+
     where η(r) = 1/√r prevents high-rank clients from dominating.
-    
+
+    When per_layer_ranks is provided (recommended), returns weights indexed
+    by (layer, client) — strictly matching the paper's α_{i,l} notation.
+
+    When per_layer_ranks is None (legacy mode), falls back to per-client
+    uniform weights across all layers.
+
     Args:
         data_sizes: {client_id: num_samples}
-        client_ranks: {client_id: lora_rank}
+        client_ranks: {client_id: lora_rank} (used only in legacy/fallback mode)
         rank_correction: Whether to apply η(r) = 1/√r correction
-    
+        rank_beta: Exponent in η(r) = r^(-rank_beta). Default 0.5 → 1/√r
+        per_layer_ranks: {layer_key: {client_id: rank}} from _extract_per_layer_ranks()
+
     Returns:
-        weights: {client_id: alpha_i}, sum to 1.0
+        {layer_key: {client_id: alpha_i_l}}, each layer's weights sum to 1.0
     """
+    # --- Paper-aligned: per-layer weights α_{i,l} ---
+    if per_layer_ranks is not None:
+        layer_weights = {}
+        for layer_key, layer_client_ranks in per_layer_ranks.items():
+            raw_weights = {}
+            for cid in layer_client_ranks:
+                n_i = data_sizes.get(cid, 1)
+                r_il = layer_client_ranks[cid]
+
+                if rank_correction and r_il > 0:
+                    eta = float(r_il) ** (-rank_beta)
+                else:
+                    eta = 1.0
+
+                raw_weights[cid] = n_i * eta
+
+            # Normalize per layer: Σ_i α_{i,l} = 1
+            total_w = sum(raw_weights.values())
+            if total_w > 0:
+                layer_weights[layer_key] = {
+                    cid: w / total_w for cid, w in raw_weights.items()
+                }
+            else:
+                layer_weights[layer_key] = {}
+
+        return layer_weights
+
+    # --- Legacy fallback: per-client uniform weights ---
     weights = {}
-    
     for cid in data_sizes:
         n_i = data_sizes[cid]
         r_i = client_ranks.get(cid, 1)
-        
+
         if rank_correction and r_i > 0:
             eta = float(r_i) ** (-rank_beta)
         else:
             eta = 1.0
-        
+
         weights[cid] = n_i * eta
-    
-    # Normalize
+
     total_weight = sum(weights.values())
     if total_weight > 0:
         for cid in weights:
             weights[cid] /= total_weight
-    
-    return weights
+
+    # Legacy format: wrap into per-layer dict for downstream compatibility.
+    # All layers share the same per-client weight vector.
+    legacy_wrapped = {}  # will be populated by caller if needed
+    # Store flat weights for backward compat; caller should migrate to per-layer API
+    return weights  # backward-compat return: Dict[int, float]
 
 
 # ============================================================
-# Step 3: Weighted Aggregation in Update Space
+# Step 3: Weighted Aggregation in Update Space (Per-Layer)
 # ============================================================
 
 def aggregate_true_updates(
     true_deltas: Dict[str, List[Tuple[int, torch.Tensor]]],
-    agg_weights: Dict[int, float],
+    agg_weights,  # Dict[str, Dict[int, float]] per-layer OR Dict[int, float] legacy
 ) -> Dict[str, torch.Tensor]:
     """
     Compute weighted average of true updates in the dense update space.
-    
-    ΔW̄_l = Σ_{i∈S_t} α_{i,l} · ΔW_{i,l}
-    
+
+    Paper formula:
+        ΔW̄_l = Σ_{i∈S_t} α_{i,l} · ΔW_{i,l}
+
+    When agg_weights is per-layer {layer_key: {cid: alpha}}, uses α_{i,l}
+    strictly as defined in the paper. When it's a flat {cid: alpha}, falls
+    back to uniform-per-layer weights (legacy behavior).
+
     Args:
         true_deltas: output from recover_true_updates()
+                   {layer_key: [(client_id, delta_tensor), ...]}
         agg_weights: output from compute_aggregation_weights()
-    
+                    - New: {layer_key: {client_id: alpha_i_l}}
+                    - Legacy: {client_id: alpha_i}
+
     Returns:
         aggregated: {layer_key: aggregated ΔW tensor}
     """
     aggregated = {}
-    
+
+    # Detect format
+    _is_per_layer = (
+        isinstance(agg_weights, dict) and
+        bool(agg_weights) and
+        isinstance(next(iter(agg_weights.values())), dict)
+    )
+
     for layer_key, client_delta_list in true_deltas.items():
         if not client_delta_list:
             continue
-        
-        # Get reference shape from first entry
+
         ref_delta = client_delta_list[0][1]
         agg_delta = torch.zeros_like(ref_delta)
-        
+
         for client_id, delta in client_delta_list:
-            w = agg_weights.get(client_id, 0.0)
+            if _is_per_layer:
+                # Paper-aligned: α_{i,l} — weight specific to this layer
+                layer_w = agg_weights.get(layer_key, {})
+                w = layer_w.get(client_id, 0.0)
+            else:
+                # Legacy fallback: same α_i for all layers
+                w = agg_weights.get(client_id, 0.0)
+
             agg_delta += w * delta
-        
+
         aggregated[layer_key] = agg_delta
-    
+
     return aggregated
 
 
@@ -641,12 +728,15 @@ class HeteroLoRAAggregator:
               f'Recovered true updates from {len(client_factors_list)} clients, '
               f'{len(true_deltas)} LoRA layers')
         
-        # --- Step 2: Compute aggregation weights ---
+        # --- Step 2: Compute per-layer aggregation weights α_{i,l} ---
+        # Extract per-layer per-client ranks from LoRA factor shapes
+        per_layer_ranks = _extract_per_layer_ranks(client_factors_list)
         agg_weights = compute_aggregation_weights(
-            data_sizes, client_ranks, self.rank_correction, self.rank_beta
+            data_sizes, client_ranks, self.rank_correction, self.rank_beta,
+            per_layer_ranks=per_layer_ranks,  # paper-aligned: α_{i,l}
         )
         
-        # --- Step 3: Aggregate in update space ---
+        # --- Step 3: Aggregate in update space (per-layer weighted) ---
         aggregated = aggregate_true_updates(true_deltas, agg_weights)
         stats['aggregated_layers'] = len(aggregated)
         
@@ -685,7 +775,20 @@ class HeteroLoRAAggregator:
         stats['download_bytes'] = total_down_bytes
         stats['rank_beta'] = float(self.rank_beta)
         stats['rank_correction'] = bool(self.rank_correction)
-        stats['agg_weights'] = {str(cid): float(w) for cid, w in agg_weights.items()}
+        # Store per-layer weights for inspection (paper α_{i,l} format)
+        if isinstance(agg_weights, dict) and agg_weights:
+            _first_val = next(iter(agg_weights.values()))
+            if isinstance(_first_val, dict):
+                # Per-layer format: {layer_key: {cid: alpha}}
+                stats['agg_weights_per_layer'] = {
+                    lk: {str(cid): float(w) for cid, w in cw.items()}
+                    for lk, cw in agg_weights.items()
+                }
+            else:
+                # Legacy flat format
+                stats['agg_weights'] = {str(cid): float(w) for cid, w in agg_weights.items()}
+        else:
+            stats['agg_weights'] = {}
         
         self.round_num += 1
         

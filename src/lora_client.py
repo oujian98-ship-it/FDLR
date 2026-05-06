@@ -148,7 +148,7 @@ class LoRAClient:
 
         if self.args.optimizer == 'sgd':
             optimizer = torch.optim.SGD(trainable_params, lr=self.args.lr,
-                                        momentum=0.5)
+                                        momentum=getattr(self.args, 'momentum', 0.5))
         elif self.args.optimizer == 'adam':
             optimizer = torch.optim.AdamW(trainable_params, lr=self.args.lr,
                                          weight_decay=0.01)
