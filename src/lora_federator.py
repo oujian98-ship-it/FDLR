@@ -70,6 +70,9 @@ from utils import (
     export_samples,
     show_samples,
     perform_evaluation,
+    record_training_time,
+    experiment_log_dir,
+    log_timestamp,
 )
 
 # Legacy diff_model module shim (for loading old .pth files)
@@ -687,13 +690,13 @@ def run_training(args):
         root_metadata_path.unlink()
     save_lora_checkpoint(server_model, final_model_path)
     print(f'\nFinal model saved: {final_model_path}')
+    training_time_sec = time.time() - start_time
 
     # ---- Export training/communication log ----
     central_interval = int(getattr(args, 'central_agg_interval', 5))
-    eval_log_dir = parent_path / 'results' / 'eval_logs'
-    eval_log_dir.mkdir(parents=True, exist_ok=True)
-    log_ts = time.strftime('%Y%m%d-%H%M%S')
-    train_log_path = eval_log_dir / f'{final_model_name}_train_{log_ts}.log'
+    log_ts = log_timestamp()
+    train_log_dir = experiment_log_dir(parent_path, 'train_logs', 'lora', args, final_model_name)
+    train_log_path = train_log_dir / f'{log_ts}.log'
     with open(train_log_path, 'w', encoding='utf-8') as f:
         f.write(f'Training Log  {log_ts}\n')
         f.write('=' * 60 + '\n\n')
@@ -718,7 +721,7 @@ def run_training(args):
                 f'{stats.get("server_aggregation_time_sec", 0.0):.6f}\t'
                 f'{stats.get("round_wall_clock_sec", 0.0):.6f}\n'
             )
-        f.write(f'\nruntime_sec\t{time.time() - start_time:.6f}\n\n')
+        f.write(f'\nruntime_sec\t{training_time_sec:.6f}\n\n')
         f.write('[Central-window communication]\n')
         f.write('window_start_round\tupload_MB\tdownload_MB\ttotal_MB\n')
         for start in range(0, len(comm_stats_per_round), central_interval):
@@ -731,6 +734,17 @@ def run_training(args):
                 f'{down / (1024 * 1024):.6f}\t'
                 f'{(up + down) / (1024 * 1024):.6f}\n'
             )
+    record_training_time(
+        parent_path=parent_path,
+        method='lora',
+        model_name=final_model_name,
+        args=args,
+        training_time_sec=training_time_sec,
+        result_folder=result_folder,
+        model_path=final_model_path,
+        write_summary_log=False,
+        timestamp=log_ts,
+    )
 
     print(f'\n{"="*60}')
     print(f'Training Complete!')
@@ -745,7 +759,7 @@ def run_training(args):
     print(f'  Download : {total_down / (1024*1024):.2f} MB')
     print(f'  Total    : {total_total / (1024*1024):.2f} MB')
     
-    print(f'\nTotal runtime: {time.time()-start_time:.1f}s')
+    print(f'\nTotal runtime: {training_time_sec:.1f}s')
     print(f'Root model: {final_model_path}')
     print(f'Result model: {final_path}')
     print(f'Results folder: {result_folder}')
@@ -786,6 +800,11 @@ def run_inference(args):
         model = model.to(device)
         model.eval()
         print(f'Loaded model with {sum(p.numel() for p in model.parameters()):,} params')
+    elif args.train == 0 and getattr(args, 'load_model', ''):
+        raise FileNotFoundError(
+            f'--train=0 requested inference/evaluation, but no LoRA model was found at {load_path}. '
+            f'Check --load_model; refusing to evaluate an untrained model.'
+        )
     else:
         # Fallback: build from scratch + inject LoRA (untrained)
         print('[Warning] No trained model found, building untrained model')
@@ -846,19 +865,12 @@ def run_inference(args):
         print(f'  Fake (generated): {fake_dir}')
         print(f'{"="*50}')
 
-        import datetime as _dt
-        _ts = _dt.datetime.now().strftime('%Y%m%d-%H%M%S')
+        _ts = log_timestamp()
         _lora_rank = getattr(args, 'lora_rank', 8)
         _global_rank = getattr(args, 'global_lora_rank', _lora_rank)
         _agg_mode = getattr(args, 'agg_mode', 'fdlr')
-        if getattr(args, 'load_model', ''):
-            _model_stem = Path(args.load_model).stem
-            _tag = f'eval_lora_{args.dataset}_{_model_stem}_{_agg_mode}_{_ts}.log'
-        else:
-            _tag = (f'eval_lora_{args.dataset}_R[{args.rounds}]_K[{args.num_users}]'
-                    f'_r[{_lora_rank}g{_global_rank}]_E[{args.local_ep}]'
-                    f'_B[{args.local_bs}]_{_agg_mode}_{_ts}.log')
-        _eval_log_dir = parent_path / 'results' / 'eval_logs'
+        _tag = f'{_ts}.log'
+        _eval_log_dir = experiment_log_dir(parent_path, 'eval_logs', 'lora', args, model_name)
         _lora_ranks = getattr(args, 'lora_ranks', '')
         _client_mode = 'Heterogeneous' if _lora_ranks else 'Homogeneous'
         _experiment_meta = {

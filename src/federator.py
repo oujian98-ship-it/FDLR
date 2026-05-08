@@ -46,7 +46,7 @@ from options import args_parser
 from unet import UnetConditional, Unet
 from utils import exp_details, DecoderTrainingTask, is_up_parameter, \
     is_mid_parameter, export_dataset, count_model_parameters, count_update_parameters, get_partitioned_dataset, \
-    export_samples, show_samples, perform_evaluation
+    export_samples, show_samples, perform_evaluation, record_training_time, experiment_log_dir, log_timestamp
 
 
 def parse_dim_mults(dim_mults_str: str):
@@ -180,8 +180,10 @@ def main(args):
         else:
             raise ValueError(f'Unsupported model format in {existing_model_path}')
     elif args.train == 0 and not found_existing_model:
-        print(f'Warning: --train=0 but no model found at {existing_model_path}, using random weights')
-        print('Use --load_model=<path> to specify a pre-trained model file')
+        raise FileNotFoundError(
+            f'--train=0 requested inference/evaluation, but no model was found at {existing_model_path}. '
+            f'Check --load_model; refusing to evaluate random weights.'
+        )
 
     num_params = count_model_parameters(global_model)
     print(f"{'Creating' if args.train == 1 else 'Using'} model with {num_params} "
@@ -322,6 +324,7 @@ def main(args):
                 writer.writerow([value1, value2])
             writer.writerow(["runtime", time.time() - start_time])
 
+        final_recorded_model_path = None
         if save_local_models:
             # In case of udec or ulatdec training, export all client models separately
             for client in client_models.keys():
@@ -330,12 +333,15 @@ def main(args):
                 client_model_path = model_folder / f'{model_name}_client[{client}].pth'
                 torch.save(client_models[client].local_model, client_model_path)
                 print(f'Exported final client model {client_model_path}')
+                if final_recorded_model_path is None:
+                    final_recorded_model_path = client_model_path
         else:
             # Export the final model in the result and model folders
             final_model_path = result_folder / f'{model_name}.pth'
             torch.save(global_model, final_model_path)
             final_model_path = model_folder / f'{model_name}.pth'
             torch.save(global_model, final_model_path)
+            final_recorded_model_path = final_model_path
             # Also save a simplified copy to project root with hyperparam tags
             root_model_name = (f'fedavg_model_{args.dataset}'
                                f'_R[{args.rounds + args.round_offset}]'
@@ -343,6 +349,17 @@ def main(args):
             torch.save(global_model, parent_path / root_model_name)
             print(f'Exported final model {final_model_path}')
             print(f'Also saved to project root: {root_model_name}')
+
+        training_time_sec = time.time() - start_time
+        record_training_time(
+            parent_path=parent_path,
+            method='fedavg',
+            model_name=model_name,
+            args=args,
+            training_time_sec=training_time_sec,
+            result_folder=result_folder,
+            model_path=final_recorded_model_path,
+        )
 
     if args.export_dataset > 0:
         real_split = getattr(args, 'eval_real_split', 'train')
@@ -372,15 +389,9 @@ def main(args):
         print(f'  Fake (generated): {fake_dir}')
         print(f'{"="*50}')
 
-        import datetime as _dt
-        _ts = _dt.datetime.now().strftime('%Y%m%d-%H%M%S')
-        if args.train == 0 and getattr(args, 'load_model', ''):
-            _model_stem = Path(args.load_model).stem
-            _tag = f'eval_fedavg_{args.dataset}_{_model_stem}_{_ts}.log'
-        else:
-            _tag = (f'eval_fedavg_{args.dataset}_R[{args.rounds}]_K[{args.num_users}]'
-                    f'_E[{args.local_ep}]_B[{args.local_bs}]_{_ts}.log')
-        _eval_log_dir = parent_path / 'results' / 'eval_logs'
+        _ts = log_timestamp()
+        _tag = f'{_ts}.log'
+        _eval_log_dir = experiment_log_dir(parent_path, 'eval_logs', 'fedavg', args, model_name)
         _experiment_meta = {
             'Method': 'fedavg',
             'Load model': getattr(args, 'load_model', '') or '(none)',

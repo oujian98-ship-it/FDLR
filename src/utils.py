@@ -5,7 +5,9 @@
 import os
 import pickle
 import sys
+import re
 from argparse import Namespace
+from datetime import datetime
 from pathlib import Path
 
 import matplotlib.animation as animation
@@ -42,6 +44,36 @@ def create_precision_recall_config(path_real='', path_fake='', batch_size=50, k=
                                    fname_precalc='', toy=False):
     return Namespace(path_real=path_real, path_fake=path_fake, batch_size=batch_size, k=k, num_samples=num_samples,
                      fname_precalc=fname_precalc, toy=toy)
+
+
+def log_timestamp():
+    return datetime.now().strftime('%Y%m%d-%H%M%S')
+
+
+def build_experiment_log_name(method, args, model_name=''):
+    """Return method_dataset_R[x]_K[x]_E[x], preferring explicit tags in model paths."""
+    dataset = getattr(args, 'dataset', '')
+    source = ' '.join(str(x) for x in (
+        model_name,
+        getattr(args, 'load_model', ''),
+        getattr(args, 'resume_model', ''),
+    ) if x)
+
+    def _find_tag(tag, default):
+        match = re.search(rf'{tag}\[([^\]]+)\]', source)
+        return match.group(1) if match else default
+
+    rounds = _find_tag('R', getattr(args, 'rounds', ''))
+    num_users = _find_tag('K', getattr(args, 'num_users', ''))
+    local_ep = _find_tag('E', getattr(args, 'local_ep', ''))
+    return f'{method}_{dataset}_R[{rounds}]_K[{num_users}]_E[{local_ep}]'
+
+
+def experiment_log_dir(parent_path, log_kind, method, args, model_name=''):
+    """Build logs/<log_kind>/<method_dataset_R[x]_K[x]_E[x]>."""
+    folder = Path(parent_path) / 'logs' / log_kind / build_experiment_log_name(method, args, model_name)
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
 
 
 def perform_evaluation(real_path, fake_path, dataset_to_export=None, num_samples=100,
@@ -85,7 +117,7 @@ def perform_evaluation(real_path, fake_path, dataset_to_export=None, num_samples
     if eval_log_dir:
         eval_log_dir = Path(eval_log_dir)
         eval_log_dir.mkdir(parents=True, exist_ok=True)
-        ts = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+        ts = log_timestamp()
         if config_tag and config_tag.endswith('.log'):
             log_name = config_tag
         else:
@@ -112,6 +144,36 @@ def perform_evaluation(real_path, fake_path, dataset_to_export=None, num_samples
         'inception_score': _is_result,
         'precision_recall': _pr_result,
     }
+
+
+def record_training_time(parent_path, method, model_name, args, training_time_sec,
+                         result_folder=None, model_path=None, write_summary_log=True,
+                         timestamp=None):
+    """Write a timestamped training-only runtime log for an experiment."""
+    parent_path = Path(parent_path)
+    file_ts = timestamp or log_timestamp()
+    display_ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    detail_path = None
+    if write_summary_log:
+        detail_dir = experiment_log_dir(parent_path, 'train_logs', method, args, model_name)
+        detail_path = detail_dir / f'{file_ts}.log'
+        with open(detail_path, 'w', encoding='utf-8') as f:
+            f.write(f'Training Log  {file_ts}\n')
+            f.write('=' * 60 + '\n\n')
+            f.write(f'timestamp: {display_ts}\n')
+            f.write(f'method: {method}\n')
+            f.write(f'model_name: {model_name}\n')
+            f.write(f'training_time_sec: {float(training_time_sec):.6f}\n')
+            f.write(f'training_time_min: {float(training_time_sec) / 60.0:.6f}\n')
+            if result_folder is not None:
+                f.write(f'result_folder: {result_folder}\n')
+            if model_path is not None:
+                f.write(f'model_path: {model_path}\n')
+
+    if detail_path is not None:
+        print(f'Training time recorded: {float(training_time_sec):.2f}s -> {detail_path}')
+    return detail_path
 
 
 class LabeledCelebA(Dataset):
@@ -191,6 +253,20 @@ def save_image_01(tensor, path, data_range='auto'):
         x = (x + 1.0) / 2.0
     x = x.clamp(0.0, 1.0)
     torchvision.utils.save_image(x, path)
+
+
+def clear_export_images(folder):
+    """Remove stale generated images so repeated evaluations stay comparable."""
+    image_exts = {'.png', '.jpg', '.jpeg'}
+    folder = Path(folder)
+    if not folder.exists():
+        return 0
+    removed = 0
+    for item in folder.iterdir():
+        if item.is_file() and item.suffix.lower() in image_exts:
+            item.unlink()
+            removed += 1
+    return removed
 
 
 def transform_celeba(image):
@@ -617,6 +693,10 @@ def export_samples(diffuser, folder, conditional, model, time_steps, image_size,
                    num_images=1000, use_ddim=False, ddim_steps=100, batch_size=256, data_range='auto'):
     if not os.path.exists(folder):
         os.makedirs(folder)
+    else:
+        removed = clear_export_images(folder)
+        if removed:
+            print(f'Cleared {removed} stale images from {folder}')
 
     labels = []
     if conditional:

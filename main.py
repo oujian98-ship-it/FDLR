@@ -40,11 +40,11 @@ PARTITION = ''                 # fedphd-cifar2 | fedphd-celeba4 | 空字符串
 SEED = 42                    # 随机种子
 
 # ---- 训练方法选择 ----
-METHOD = 'lora'             # 方法: lora | fedavg
+METHOD = 'fedavg'             # 方法: lora | fedavg
 
 # ---- 联邦学习超参 ----
-ROUNDS = 30                 # 全局训练轮数 R
-NUM_USERS = 5               # 客户端数量 K
+ROUNDS = 15                 # 全局训练轮数 R
+NUM_USERS = 2               # 客户端数量 K
 FRAC = 1.0                  # 每轮参与客户端比例 C
 LOCAL_EP = 5                # 本地训练轮次 E
 LOCAL_BS = 128              # 本地 batch size B
@@ -403,26 +403,38 @@ PRESETS = {
         'use_ddim': 1, 'ddim_steps': 100, 'eval_num_samples': 30000, 'eval_batch_size': 128,
         'eval_real_split': 'train', 'central_agg_interval': 5, 'seed': 2023, 'train': 1,
     },
-    'infer_celeba': {
-        'description': 'CelebA 推理: 生成图片 + FID评估',
-        'method': 'lora', 'dataset': 'celeba',
-        'train': 0,
-        'load_model': 'flora_model_celeba_R[10]_K[5]_E[3].pth',
+    # ---- 推理评估 (train=0) ----
+    # LoRA 推理
+    'infer_celeba_lora': {
+        'description': 'CelebA LoRA 推理: 生成图片 + FID评估',
+        'method': 'lora', 'dataset': 'celeba', 'train': 0,
+        'load_model': 'flora_model_celeba_R[30]_K[5]_E[5].pth',
         'export_samples': 5000, 'export_dataset': 5000,
     },
-    'infer_fmnist': {
-        'description': 'FMNIST 推理: 生成图片 + FID评估',
-        'method': 'lora', 'dataset': 'fmnist',
-        'train': 0,
+    'infer_fmnist_lora': {
+        'description': 'FMNIST LoRA 推理: 生成图片 + FID评估',
+        'method': 'lora', 'dataset': 'fmnist', 'train': 0,
         'load_model': 'flora_model_fmnist_R[15]_K[5]_E[5].pth',
         'export_samples': 5000, 'export_dataset': 5000,
     },
-    'infer_cifar10': {
-        'description': 'CIFAR10 推理: 生成图片 + FID评估',
-        'method': 'lora', 'dataset': 'cifar10',
-        'train': 0,
-        'load_model': 'flora_model_cifar10_R[10]_K[5]_E[3].pth',
+    'infer_cifar10_lora': {
+        'description': 'CIFAR10 LoRA 推理: 生成图片 + FID评估',
+        'method': 'lora', 'dataset': 'cifar10', 'train': 0,
+        'load_model': 'flora_model_cifar10_R[2000]_K[20]_E[5].pth',
         'export_samples': 30000, 'export_dataset': 30000,
+    },
+    # FedAvg 推理
+    'infer_celeba_fedavg': {
+        'description': 'CelebA FedAvg 推理: 生成图片 + FID评估',
+        'method': 'fedavg', 'dataset': 'celeba', 'train': 0,
+        'load_model': 'fedavg_model_celeba_R[30]_K[5]_E[5].pth',
+        'export_samples': 5000, 'export_dataset': 5000,
+    },
+    'infer_fmnist_fedavg': {
+        'description': 'FMNIST FedAvg 推理: 生成图片 + FID评估',
+        'method': 'fedavg', 'dataset': 'fmnist', 'train': 0,
+        'load_model': 'fedavg_model_fmnist_R[15]_K[5]_E[5].pth',
+        'export_samples': 5000, 'export_dataset': 5000,
     },
 }
 
