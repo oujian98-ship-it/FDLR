@@ -41,6 +41,19 @@ class Client(object):
         self.diffuser = diffuser
 
     def freeze_weights(self, training_task):
+        if training_task is None:
+            for _, param in self.local_model.named_parameters():
+                param.requires_grad = True
+            return
+
+        if isinstance(training_task, DecoderTrainingTask):
+            for name, param in self.local_model.named_parameters():
+                param.requires_grad = (
+                    is_up_parameter(name)
+                    or (training_task.mid and is_mid_parameter(name))
+                )
+            return
+
         if isinstance(training_task, SplitTrainingTask):
             for name, param in self.local_model.named_parameters():
                 if is_up_parameter(name) and not training_task.up:
@@ -100,6 +113,7 @@ class Client(object):
     def update_diff_weights(self, model_update, training_task):
         # Apply the global model update from the server
         self.apply_global_update(model_update, training_task)
+        self.freeze_weights(training_task)
 
         # Set mode to train model
         self.local_model.train()

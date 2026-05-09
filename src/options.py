@@ -70,6 +70,8 @@ def args_parser():
                         help='batch size for FedPhD-aligned generation/evaluation')
     parser.add_argument('--central_agg_interval', type=int, default=5,
                         help='central aggregation interval for FedPhD-style communication reporting')
+    parser.add_argument('--checkpoint_interval', type=int, default=10,
+                        help='save intermediate checkpoints every N rounds; 0 saves only final model')
     parser.add_argument('--compute_is', type=int, default=1,
                         help='whether to compute Inception Score')
     parser.add_argument('--eval_real_split', type=str, default='train', choices=['train', 'test'],

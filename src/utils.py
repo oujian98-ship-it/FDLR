@@ -53,6 +53,7 @@ def log_timestamp():
 def build_experiment_log_name(method, args, model_name=''):
     """Return method_dataset_R[x]_K[x]_E[x], preferring explicit tags in model paths."""
     dataset = getattr(args, 'dataset', '')
+    train_mode = getattr(args, 'train_mode', 'full')
     source = ' '.join(str(x) for x in (
         model_name,
         getattr(args, 'load_model', ''),
@@ -66,6 +67,12 @@ def build_experiment_log_name(method, args, model_name=''):
     rounds = _find_tag('R', getattr(args, 'rounds', ''))
     num_users = _find_tag('K', getattr(args, 'num_users', ''))
     local_ep = _find_tag('E', getattr(args, 'local_ep', ''))
+    if method == 'fedavg':
+        for mode in ('full', 'usplit', 'udec', 'ulatdec'):
+            if re.search(rf'(^|_){mode}(_|$)', source):
+                train_mode = mode
+                break
+        return f'{method}_{train_mode}_{dataset}_R[{rounds}]_K[{num_users}]_E[{local_ep}]'
     return f'{method}_{dataset}_R[{rounds}]_K[{num_users}]_E[{local_ep}]'
 
 
@@ -148,7 +155,7 @@ def perform_evaluation(real_path, fake_path, dataset_to_export=None, num_samples
 
 def record_training_time(parent_path, method, model_name, args, training_time_sec,
                          result_folder=None, model_path=None, write_summary_log=True,
-                         timestamp=None):
+                         timestamp=None, extra_stats=None):
     """Write a timestamped training-only runtime log for an experiment."""
     parent_path = Path(parent_path)
     file_ts = timestamp or log_timestamp()
@@ -166,7 +173,12 @@ def record_training_time(parent_path, method, model_name, args, training_time_se
             f.write(f'model_name: {model_name}\n')
             f.write(f'training_time_sec: {float(training_time_sec):.6f}\n')
             f.write(f'training_time_min: {float(training_time_sec) / 60.0:.6f}\n')
+            if extra_stats:
+                f.write('\n[Final stats]\n')
+                for key, value in extra_stats.items():
+                    f.write(f'{key}: {value}\n')
             if result_folder is not None:
+                f.write('\n[Artifacts]\n')
                 f.write(f'result_folder: {result_folder}\n')
             if model_path is not None:
                 f.write(f'model_path: {model_path}\n')
@@ -645,7 +657,7 @@ def record_net_data_stats(y_train, net_dataidx_map):
 
 
 def is_down_parameter(name):
-    return 'init_' in name or 'time_' in name or 'downs' in name
+    return 'init_' in name or 'time_' in name or 'downs' in name or 'label_emb' in name
 
 
 def is_mid_parameter(name):

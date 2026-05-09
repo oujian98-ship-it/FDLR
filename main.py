@@ -40,10 +40,10 @@ PARTITION = ''                 # fedphd-cifar2 | fedphd-celeba4 | 空字符串
 SEED = 42                    # 随机种子
 
 # ---- 训练方法选择 ----
-METHOD = 'fedavg'             # 方法: lora | fedavg
+METHOD = 'lora'             # 方法: lora | fedavg
 
 # ---- 联邦学习超参 ----
-ROUNDS = 15                 # 全局训练轮数 R
+ROUNDS = 100                 # 全局训练轮数 R
 NUM_USERS = 2               # 客户端数量 K
 FRAC = 1.0                  # 每轮参与客户端比例 C
 LOCAL_EP = 5                # 本地训练轮次 E
@@ -86,6 +86,7 @@ EXP_ROUNDS = 0              # 中间轮次导出间隔
 EVAL_NUM_SAMPLES = 30000    # FedPhD 对齐评估生成样本数
 EVAL_BATCH_SIZE = 256       # FedPhD 对齐评估 batch size
 CENTRAL_AGG_INTERVAL = 5    # FedPhD central aggregation 通信统计窗口
+CHECKPOINT_INTERVAL = 10    # 中间 checkpoint 保存间隔；0 表示只保存最终模型
 COMPUTE_IS = 1              # 评估时计算 Inception Score
 EVAL_REAL_SPLIT = 'train'   # FedPhD-style 使用 train split 作为真实参考
 DATA_RANGE = 'minus1_1'     # minus1_1=协议范围；0_1=兼容旧 model_cifar.pth
@@ -427,13 +428,15 @@ PRESETS = {
     'infer_celeba_fedavg': {
         'description': 'CelebA FedAvg 推理: 生成图片 + FID评估',
         'method': 'fedavg', 'dataset': 'celeba', 'train': 0,
-        'load_model': 'fedavg_model_celeba_R[30]_K[5]_E[5].pth',
+        'train_mode': 'full',
+        'load_model': 'fedavg_model_celeba_full_R[30]_K[5]_E[5].pth',
         'export_samples': 5000, 'export_dataset': 5000,
     },
     'infer_fmnist_fedavg': {
         'description': 'FMNIST FedAvg 推理: 生成图片 + FID评估',
         'method': 'fedavg', 'dataset': 'fmnist', 'train': 0,
-        'load_model': 'fedavg_model_fmnist_R[15]_K[5]_E[5].pth',
+        'train_mode': 'full',
+        'load_model': 'fedavg_model_fmnist_full_R[15]_K[5]_E[5].pth',
         'export_samples': 5000, 'export_dataset': 5000,
     },
 }
@@ -499,6 +502,7 @@ def build_args_from_config():
         eval_num_samples=ds_cfg.get('eval_num_samples', EVAL_NUM_SAMPLES),
         eval_batch_size=ds_cfg.get('eval_batch_size', EVAL_BATCH_SIZE),
         central_agg_interval=CENTRAL_AGG_INTERVAL,
+        checkpoint_interval=CHECKPOINT_INTERVAL,
         compute_is=COMPUTE_IS,
         eval_real_split=EVAL_REAL_SPLIT,
         data_range=DATA_RANGE,
@@ -568,6 +572,7 @@ def apply_cli_overrides(args):
     parser.add_argument('--eval_num_samples', type=int)
     parser.add_argument('--eval_batch_size', type=int)
     parser.add_argument('--central_agg_interval', type=int)
+    parser.add_argument('--checkpoint_interval', type=int)
     parser.add_argument('--compute_is', type=int)
     parser.add_argument('--eval_real_split', type=str)
     parser.add_argument('--data_range', type=str)
@@ -677,12 +682,12 @@ def print_config_summary(args):
 # ============================================================
 
 def run_fedavg(args):
-    from federator import main as fedavg_main
+    from src.federator import main as fedavg_main
     fedavg_main(args)
 
 
 def run_lora(args):
-    from lora_federator import main as lora_main
+    from src.lora_federator import main as lora_main
     lora_main(args)
 
 

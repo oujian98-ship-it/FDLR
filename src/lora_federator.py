@@ -328,6 +328,7 @@ def save_experiment_protocol(result_folder: Path, args, data_stats, num_params, 
         "use_procrustes": getattr(args, "use_procrustes", 1),
         "use_prefix_init": getattr(args, "use_prefix_init", 1),
         "agg_mode": getattr(args, "agg_mode", "fdlr"),
+        "checkpoint_interval": getattr(args, "checkpoint_interval", 10),
         "seed": getattr(args, "seed", 2023),
         "total_params": int(num_params),
         "trainable_params": int(lora_params),
@@ -522,6 +523,12 @@ def run_training(args):
     # Create clients (lazy creation on first use, then cached)
     cache_clients = bool(getattr(args, 'cache_clients', 0))
     client_cache = {}
+    checkpoint_interval = int(getattr(args, 'checkpoint_interval', 10))
+    print(
+        f'Checkpoint interval: every {checkpoint_interval} rounds'
+        if checkpoint_interval > 0 else
+        'Checkpoint interval: disabled (final model only)'
+    )
     agg_round_num = 0
 
     start_round = int(getattr(args, 'start_round', 0))
@@ -642,16 +649,25 @@ def run_training(args):
 
         avg_loss = sum(local_losses) / len(local_losses) if local_losses else 0.0
         train_losses.append(avg_loss)
+        round_upload_params = agg_result["stats"].get("upload_bytes", 0) / 4
+        round_download_params = agg_result["stats"].get("download_bytes", 0) / 4
+        round_total_params = round_upload_params + round_download_params
 
         print(f'\nRound {round_idx} summary:')
         print(f'  Avg loss: {avg_loss:.4f}')
-        print(f'  Upload bytes: {agg_result["stats"].get("upload_bytes", 0)/1024:.1f} KB')
-        print(f'  Download bytes: {agg_result["stats"].get("download_bytes", 0)/1024:.1f} KB')
+        print(f'  Upload params: {round_upload_params:.0f} ({round_upload_params / 1_000_000:.6f} x1e6)')
+        print(f'  Download params: {round_download_params:.0f} ({round_download_params / 1_000_000:.6f} x1e6)')
+        print(f'  Total comm N (x1e6 params): {round_total_params / 1_000_000:.6f}')
         elapsed = time.time() - start_time
         print(f'  Wall-clock: {elapsed:.1f}s')
 
-        # ---- Save checkpoints ----
-        if round_idx % max(1, args.rounds // 5) == 0 or round_idx == args.rounds - 1:
+        # ---- Save intermediate checkpoints ----
+        should_save_checkpoint = (
+            checkpoint_interval > 0
+            and round_idx < args.rounds - 1
+            and ((round_idx + 1) % checkpoint_interval == 0)
+        )
+        if should_save_checkpoint:
             ckpt_path = result_folder / f'{final_model_name}_round[{round_idx}].pth'
             save_lora_checkpoint(server_model, ckpt_path, round_idx)
             save_lora_metadata(
@@ -691,6 +707,12 @@ def run_training(args):
     save_lora_checkpoint(server_model, final_model_path)
     print(f'\nFinal model saved: {final_model_path}')
     training_time_sec = time.time() - start_time
+    total_up = sum(s.get('upload_bytes', 0) for s in comm_stats_per_round)
+    total_down = sum(s.get('download_bytes', 0) for s in comm_stats_per_round)
+    total_total = total_up + total_down
+    total_up_params = total_up / 4
+    total_down_params = total_down / 4
+    total_comm_params = total_total / 4
 
     # ---- Export training/communication log ----
     central_interval = int(getattr(args, 'central_agg_interval', 5))
@@ -706,33 +728,55 @@ def run_training(args):
         f.write(f'Clients       : {args.num_users}\n')
         f.write(f'Local epochs  : {args.local_ep}\n')
         f.write(f'Local batch   : {args.local_bs}\n')
+        f.write(f'Checkpoint every: {checkpoint_interval if checkpoint_interval > 0 else "final-only"}\n')
         f.write(f'Results folder: {result_folder}\n')
         f.write(f'Root model    : {final_model_path}\n')
         f.write(f'Result model  : {final_path}\n\n')
+        f.write('[Final stats]\n')
+        f.write(f'training_time_sec\t{training_time_sec:.6f}\n')
+        f.write(f'training_time_min\t{training_time_sec / 60.0:.6f}\n')
+        f.write(f'total_params\t{int(num_params)}\n')
+        f.write(f'global_lora_trainable_params\t{int(lora_params)}\n')
+        f.write(f'global_lora_trainable_ratio_pct\t{100 * lora_params / num_params:.6f}\n')
+        f.write(f'final_avg_loss\t{train_losses[-1]:.6f}\n' if train_losses else 'final_avg_loss\t\n')
+        f.write(f'total_upload_params\t{total_up_params:.0f}\n')
+        f.write(f'total_download_params\t{total_down_params:.0f}\n')
+        f.write(f'total_communication_params\t{total_comm_params:.0f}\n')
+        f.write(f'total_upload_N_x1e6_params\t{total_up_params / 1_000_000:.6f}\n')
+        f.write(f'total_download_N_x1e6_params\t{total_down_params / 1_000_000:.6f}\n')
+        f.write(f'communication_N_x1e6_params\t{total_comm_params / 1_000_000:.6f}\n\n')
         f.write('[Per-round]\n')
-        f.write('round\tloss\tupload_kb\tdownload_kb\tserver_aggregation_time_sec\tround_wall_clock_sec\n')
+        f.write('round\tloss\tupload_params\tdownload_params\ttotal_N_x1e6_params\tserver_aggregation_time_sec\tround_wall_clock_sec\n')
         for idx, (loss, stats) in enumerate(zip(train_losses, comm_stats_per_round)):
             round_num = start_round + idx
+            up_params = stats.get("upload_bytes", 0) / 4
+            down_params = stats.get("download_bytes", 0) / 4
             f.write(
                 f'{round_num}\t'
                 f'{loss:.6f}\t'
-                f'{stats.get("upload_bytes", 0) / 1024:.6f}\t'
-                f'{stats.get("download_bytes", 0) / 1024:.6f}\t'
+                f'{up_params:.0f}\t'
+                f'{down_params:.0f}\t'
+                f'{(up_params + down_params) / 1_000_000:.6f}\t'
                 f'{stats.get("server_aggregation_time_sec", 0.0):.6f}\t'
                 f'{stats.get("round_wall_clock_sec", 0.0):.6f}\n'
             )
         f.write(f'\nruntime_sec\t{training_time_sec:.6f}\n\n')
         f.write('[Central-window communication]\n')
-        f.write('window_start_round\tupload_MB\tdownload_MB\ttotal_MB\n')
+        f.write('window_start_round\tupload_params\tdownload_params\ttotal_params\tupload_N_x1e6_params\tdownload_N_x1e6_params\ttotal_N_x1e6_params\n')
         for start in range(0, len(comm_stats_per_round), central_interval):
             chunk = comm_stats_per_round[start:start + central_interval]
             up = sum(s.get('upload_bytes', 0) for s in chunk)
             down = sum(s.get('download_bytes', 0) for s in chunk)
+            up_params = up / 4
+            down_params = down / 4
             f.write(
                 f'{start_round + start}\t'
-                f'{up / (1024 * 1024):.6f}\t'
-                f'{down / (1024 * 1024):.6f}\t'
-                f'{(up + down) / (1024 * 1024):.6f}\n'
+                f'{up_params:.0f}\t'
+                f'{down_params:.0f}\t'
+                f'{up_params + down_params:.0f}\t'
+                f'{up_params / 1_000_000:.6f}\t'
+                f'{down_params / 1_000_000:.6f}\t'
+                f'{(up_params + down_params) / 1_000_000:.6f}\n'
             )
     record_training_time(
         parent_path=parent_path,
@@ -744,20 +788,29 @@ def run_training(args):
         model_path=final_model_path,
         write_summary_log=False,
         timestamp=log_ts,
+        extra_stats={
+            'total_params': int(num_params),
+            'global_lora_trainable_params': int(lora_params),
+            'global_lora_trainable_ratio_pct': f'{100 * lora_params / num_params:.6f}',
+            'final_avg_loss': f'{train_losses[-1]:.6f}' if train_losses else '',
+            'total_upload_params': f'{total_up_params:.0f}',
+            'total_download_params': f'{total_down_params:.0f}',
+            'total_communication_params': f'{total_comm_params:.0f}',
+            'total_upload_N_x1e6_params': f'{total_up_params / 1_000_000:.6f}',
+            'total_download_N_x1e6_params': f'{total_down_params / 1_000_000:.6f}',
+            'communication_N_x1e6_params': f'{total_comm_params / 1_000_000:.6f}',
+        },
     )
 
     print(f'\n{"="*60}')
     print(f'Training Complete!')
     
     # Calculate and display total communication volume
-    total_up = sum(s.get('upload_bytes', 0) for s in comm_stats_per_round)
-    total_down = sum(s.get('download_bytes', 0) for s in comm_stats_per_round)
-    total_total = total_up + total_down
-    
     print(f'Total Communication Volume:')
-    print(f'  Upload   : {total_up / (1024*1024):.2f} MB')
-    print(f'  Download : {total_down / (1024*1024):.2f} MB')
-    print(f'  Total    : {total_total / (1024*1024):.2f} MB')
+    print(f'  N (x1e6 params): {total_comm_params / 1_000_000:.6f}')
+    print(f'  Upload params   : {total_up_params:.0f}')
+    print(f'  Download params : {total_down_params:.0f}')
+    print(f'  Total params    : {total_comm_params:.0f}')
     
     print(f'\nTotal runtime: {training_time_sec:.1f}s')
     print(f'Root model: {final_model_path}')
@@ -996,6 +1049,8 @@ def main(external_args=None):
                    help='Batch size for FedPhD-aligned generation/evaluation.')
     p.add_argument('--central_agg_interval', type=int, default=5,
                    help='For FedPhD-style communication reporting. Default 5.')
+    p.add_argument('--checkpoint_interval', type=int, default=10,
+                   help='Save intermediate checkpoints every N rounds; 0 saves only final model.')
     p.add_argument('--compute_is', type=int, default=1,
                    help='Whether to compute Inception Score during evaluation.')
     p.add_argument('--eval_real_split', type=str, default='train',

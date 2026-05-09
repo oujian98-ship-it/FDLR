@@ -93,6 +93,13 @@ def create_model_update(global_weights, train_mode):
         return global_weights
 
 
+def fedavg_short_model_name(args):
+    train_mode = getattr(args, 'train_mode', 'full')
+    return (f'fedavg_model_{args.dataset}_{train_mode}'
+            f'_R[{args.rounds + args.round_offset}]'
+            f'_K[{args.num_users}]_E[{args.local_ep}]')
+
+
 def main(args):
     start_time = time.time()
     parent_path = Path(__file__).parent.parent
@@ -211,6 +218,12 @@ def main(args):
         # Copy weights
         global_weights = global_model.state_dict()
         client_models = {}
+        checkpoint_interval = int(getattr(args, 'checkpoint_interval', 10))
+        print(
+            f'Checkpoint interval: every {checkpoint_interval} rounds'
+            if checkpoint_interval > 0 else
+            'Checkpoint interval: disabled (final model only)'
+        )
 
         save_local_models = args.train_mode == 'udec' or args.train_mode == 'ulatdec'
 
@@ -291,14 +304,20 @@ def main(args):
             print('Run Time: {0:0.4f} seconds'.format(time.time() - start_time))
             print("------------------------------------------------------------\n")
 
-            if save_local_models and round < args.rounds - 1:
+            should_save_checkpoint = (
+                checkpoint_interval > 0
+                and round < args.rounds - 1
+                and ((round + args.round_offset + 1) % checkpoint_interval == 0)
+            )
+
+            if save_local_models and should_save_checkpoint:
                 # Create checkpoint of all local models every global round
                 for client in client_models.keys():
                     checkpoint_path = result_folder / f'{model_name}_client[{client}]_temp_R[{round + args.round_offset}].pth'
                     torch.save(client_models[client].local_model, checkpoint_path)
                     print(f"Created model checkpoint {checkpoint_path}")
 
-            elif round < args.rounds - 1:
+            elif should_save_checkpoint:
                 # Create checkpoint of model every global round
                 checkpoint_path = result_folder / f'{model_name}_temp_R[{round + args.round_offset}].pth'
                 torch.save(global_model, checkpoint_path)
@@ -332,7 +351,10 @@ def main(args):
                 torch.save(client_models[client].local_model, client_model_path)
                 client_model_path = model_folder / f'{model_name}_client[{client}].pth'
                 torch.save(client_models[client].local_model, client_model_path)
+                root_client_model_name = f'{fedavg_short_model_name(args)}_client[{client}].pth'
+                torch.save(client_models[client].local_model, parent_path / root_client_model_name)
                 print(f'Exported final client model {client_model_path}')
+                print(f'Also saved to project root: {root_client_model_name}')
                 if final_recorded_model_path is None:
                     final_recorded_model_path = client_model_path
         else:
@@ -342,15 +364,15 @@ def main(args):
             final_model_path = model_folder / f'{model_name}.pth'
             torch.save(global_model, final_model_path)
             final_recorded_model_path = final_model_path
-            # Also save a simplified copy to project root with hyperparam tags
-            root_model_name = (f'fedavg_model_{args.dataset}'
-                               f'_R[{args.rounds + args.round_offset}]'
-                               f'_K[{args.num_users}]_E[{args.local_ep}].pth')
+            # Also save a simplified copy to project root with hyperparam tags.
+            root_model_name = f'{fedavg_short_model_name(args)}.pth'
             torch.save(global_model, parent_path / root_model_name)
             print(f'Exported final model {final_model_path}')
             print(f'Also saved to project root: {root_model_name}')
 
         training_time_sec = time.time() - start_time
+        final_params_shared = num_params_shared[-1] if num_params_shared else 0
+        cumulative_params_shared = sum(num_params_shared)
         record_training_time(
             parent_path=parent_path,
             method='fedavg',
@@ -359,6 +381,14 @@ def main(args):
             training_time_sec=training_time_sec,
             result_folder=result_folder,
             model_path=final_recorded_model_path,
+            extra_stats={
+                'model_trainable_params': num_params,
+                'final_avg_loss': f'{train_loss[-1]:.12f}' if train_loss else '',
+                'final_round_params_shared': final_params_shared,
+                'cumulative_params_shared': cumulative_params_shared,
+                'final_round_N_x1e6_params': f'{final_params_shared / 1_000_000:.6f}',
+                'communication_N_x1e6_params': f'{cumulative_params_shared / 1_000_000:.6f}',
+            },
         )
 
     if args.export_dataset > 0:
@@ -395,9 +425,10 @@ def main(args):
         _experiment_meta = {
             'Method': 'fedavg',
             'Load model': getattr(args, 'load_model', '') or '(none)',
+            'Train mode': getattr(args, 'train_mode', 'full'),
             'Data dist.': 'IID' if getattr(args, 'iid', 0) else 'Non-IID',
             'Partition': getattr(args, 'partition', '') or '(default)',
-            'Client mode': 'Homogeneous',
+            'Client mode': 'Homogeneous' if getattr(args, 'train_mode', 'full') == 'full' else getattr(args, 'train_mode', 'full'),
         }
         perform_evaluation(real_path=str(real_dir), fake_path=str(fake_dir),
                            num_samples=min(
