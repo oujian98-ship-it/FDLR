@@ -101,6 +101,24 @@ def fedavg_short_model_name(args):
 
 
 def main(args):
+    run_mode = getattr(args, 'run_mode', '') or ''
+    if run_mode == 'train':
+        args.train = 1
+        args.run_eval_after_train = 0
+    elif run_mode == 'eval':
+        args.train = 0
+        args.run_eval_after_train = 0
+    elif run_mode == 'train_eval':
+        args.train = 1
+        args.run_eval_after_train = 1
+
+    if run_mode in {'eval', 'train_eval'}:
+        eval_count = int(getattr(args, 'eval_num_samples', 0) or 0)
+        if int(getattr(args, 'export_samples', 0) or 0) <= 0:
+            args.export_samples = eval_count
+        if int(getattr(args, 'export_dataset', 0) or 0) <= 0:
+            args.export_dataset = eval_count
+
     start_time = time.time()
     parent_path = Path(__file__).parent.parent
 
@@ -152,6 +170,7 @@ def main(args):
                  f'{args.train_mode}'
     if args.train == 0 and args.load_model:
         model_name = f'infer_{Path(args.load_model).stem}'
+    run_log_ts = getattr(args, 'log_timestamp', '') or log_timestamp()
 
     # Build model structure first (always needed for training)
     global_model = UnetConditional(
@@ -381,6 +400,7 @@ def main(args):
             training_time_sec=training_time_sec,
             result_folder=result_folder,
             model_path=final_recorded_model_path,
+            timestamp=run_log_ts,
             extra_stats={
                 'model_trainable_params': num_params,
                 'final_avg_loss': f'{train_loss[-1]:.12f}' if train_loss else '',
@@ -391,7 +411,14 @@ def main(args):
             },
         )
 
-    if args.export_dataset > 0:
+    eval_phase_enabled = args.train == 0 or bool(getattr(args, 'run_eval_after_train', 0))
+    if args.train == 1 and not eval_phase_enabled and (
+        args.export_dataset > 0 or args.export_samples > 0 or args.show_samples
+    ):
+        print('[Info] Training finished. Export/evaluation skipped because run_eval_after_train=0.')
+        print('       Run a separate --train 0 command with --load_model to evaluate this model.')
+
+    if eval_phase_enabled and args.export_dataset > 0:
         real_split = getattr(args, 'eval_real_split', 'train')
         real_train = real_split == 'train'
         real_dir = parent_path / f'exports/{args.dataset}/dataset_{real_split}'
@@ -399,7 +426,7 @@ def main(args):
                        train=real_train,
                        data_range=getattr(args, 'data_range', 'minus1_1'))
         print(f'Exported {args.export_dataset} real {real_split} samples to {real_dir}')
-    if args.export_samples > 0:
+    if eval_phase_enabled and args.export_samples > 0:
         fake_dir = parent_path / f'exports/{model_name}'
         export_samples(diffuser, fake_dir, is_conditional, global_model,
                        int(args.time_steps),
@@ -409,7 +436,7 @@ def main(args):
                        batch_size=getattr(args, 'eval_batch_size', 256),
                        data_range=getattr(args, 'data_range', 'minus1_1'))
         print(f'Exported {args.export_samples} generated samples to {fake_dir}')
-    if args.export_samples > 0 and args.export_dataset > 0:
+    if eval_phase_enabled and args.export_samples > 0 and args.export_dataset > 0:
         real_split = getattr(args, 'eval_real_split', 'train')
         real_dir = parent_path / f'exports/{args.dataset}/dataset_{real_split}'
         fake_dir = parent_path / f'exports/{model_name}'
@@ -419,9 +446,9 @@ def main(args):
         print(f'  Fake (generated): {fake_dir}')
         print(f'{"="*50}')
 
-        _ts = log_timestamp()
+        _ts = run_log_ts
         _tag = f'{_ts}.log'
-        _eval_log_dir = experiment_log_dir(parent_path, 'eval_logs', 'fedavg', args, model_name)
+        _eval_log_dir = experiment_log_dir(parent_path, 'train_eval_logs', 'fedavg', args, model_name)
         _experiment_meta = {
             'Method': 'fedavg',
             'Load model': getattr(args, 'load_model', '') or '(none)',
@@ -439,8 +466,9 @@ def main(args):
                            eval_log_dir=str(_eval_log_dir), config_tag=_tag,
                            batch_size=getattr(args, 'eval_batch_size', 256),
                            compute_is=bool(getattr(args, 'compute_is', 1)),
+                           compute_pr=bool(getattr(args, 'compute_pr', 1)),
                            experiment_meta=_experiment_meta)
-    if args.show_samples:
+    if eval_phase_enabled and args.show_samples:
         show_samples(diffuser, is_conditional, global_model, train_dataset, args.time_steps, image_size,
                      channels, use_ddim=bool(getattr(args, 'use_ddim', 1)),
                      ddim_steps=getattr(args, 'ddim_steps', 100))

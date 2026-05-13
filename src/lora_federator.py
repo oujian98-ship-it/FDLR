@@ -315,6 +315,7 @@ def save_experiment_protocol(result_folder: Path, args, data_stats, num_params, 
         "eval_num_samples": getattr(args, "eval_num_samples", 30000),
         "eval_batch_size": getattr(args, "eval_batch_size", 256),
         "compute_is": getattr(args, "compute_is", 1),
+        "compute_pr": getattr(args, "compute_pr", 1),
         "eval_real_split": getattr(args, "eval_real_split", "train"),
         "data_range": getattr(args, "data_range", "minus1_1"),
         "resume_model": getattr(args, "resume_model", ""),
@@ -716,8 +717,8 @@ def run_training(args):
 
     # ---- Export training/communication log ----
     central_interval = int(getattr(args, 'central_agg_interval', 5))
-    log_ts = log_timestamp()
-    train_log_dir = experiment_log_dir(parent_path, 'train_logs', 'lora', args, final_model_name)
+    log_ts = getattr(args, 'log_timestamp', '') or log_timestamp()
+    train_log_dir = experiment_log_dir(parent_path, 'train_eval_logs', 'lora', args, final_model_name)
     train_log_path = train_log_dir / f'{log_ts}.log'
     with open(train_log_path, 'w', encoding='utf-8') as f:
         f.write(f'Training Log  {log_ts}\n')
@@ -818,6 +819,7 @@ def run_training(args):
     print(f'Results folder: {result_folder}')
     print(f'Training log: {train_log_path}')
     print(f'{"="*60}')
+    return final_model_path
 
 
 def run_inference(args):
@@ -918,12 +920,12 @@ def run_inference(args):
         print(f'  Fake (generated): {fake_dir}')
         print(f'{"="*50}')
 
-        _ts = log_timestamp()
+        _ts = getattr(args, 'log_timestamp', '') or log_timestamp()
         _lora_rank = getattr(args, 'lora_rank', 8)
         _global_rank = getattr(args, 'global_lora_rank', _lora_rank)
         _agg_mode = getattr(args, 'agg_mode', 'fdlr')
         _tag = f'{_ts}.log'
-        _eval_log_dir = experiment_log_dir(parent_path, 'eval_logs', 'lora', args, model_name)
+        _eval_log_dir = experiment_log_dir(parent_path, 'train_eval_logs', 'lora', args, model_name)
         _lora_ranks = getattr(args, 'lora_ranks', '')
         _client_mode = 'Heterogeneous' if _lora_ranks else 'Homogeneous'
         _experiment_meta = {
@@ -945,6 +947,7 @@ def run_inference(args):
                            eval_log_dir=str(_eval_log_dir), config_tag=_tag,
                            batch_size=getattr(args, 'eval_batch_size', 256),
                            compute_is=bool(getattr(args, 'compute_is', 1)),
+                           compute_pr=bool(getattr(args, 'compute_pr', 1)),
                            experiment_meta=_experiment_meta)
 
 
@@ -992,6 +995,9 @@ def main(external_args=None):
     p.add_argument('--train_mode', type=str, default='full')  # unused but kept for compat
 
     # Diffusion args
+    p.add_argument('--run_mode', type=str, default='',
+                   choices=['', 'train', 'eval', 'train_eval'],
+                   help='Run mode: train, eval, or train_eval.')
     p.add_argument('--train', type=int, default=1)
     p.add_argument('--load_model', type=str, default='')
     p.add_argument('--resume_model', type=str, default='',
@@ -1051,8 +1057,14 @@ def main(external_args=None):
                    help='For FedPhD-style communication reporting. Default 5.')
     p.add_argument('--checkpoint_interval', type=int, default=10,
                    help='Save intermediate checkpoints every N rounds; 0 saves only final model.')
+    p.add_argument('--run_eval_after_train', type=int, default=0,
+                   help='Whether to export/evaluate immediately after training.')
+    p.add_argument('--log_timestamp', type=str, default='',
+                   help='Optional fixed timestamp for train/eval log file.')
     p.add_argument('--compute_is', type=int, default=1,
                    help='Whether to compute Inception Score during evaluation.')
+    p.add_argument('--compute_pr', type=int, default=1,
+                   help='Whether to compute Precision/Recall during evaluation.')
     p.add_argument('--eval_real_split', type=str, default='train',
                    choices=['train', 'test'],
                    help='Which real split to export for FID/IS reference. FedPhD-style uses train.')
@@ -1068,8 +1080,29 @@ def main(external_args=None):
     else:
         args = p.parse_args()
 
+    run_mode = getattr(args, 'run_mode', '') or ''
+    if run_mode == 'train':
+        args.train = 1
+        args.run_eval_after_train = 0
+    elif run_mode == 'eval':
+        args.train = 0
+        args.run_eval_after_train = 0
+    elif run_mode == 'train_eval':
+        args.train = 1
+        args.run_eval_after_train = 1
+
+    if run_mode in {'eval', 'train_eval'}:
+        eval_count = int(getattr(args, 'eval_num_samples', 0) or 0)
+        if int(getattr(args, 'export_samples', 0) or 0) <= 0:
+            args.export_samples = eval_count
+        if int(getattr(args, 'export_dataset', 0) or 0) <= 0:
+            args.export_dataset = eval_count
+
     if args.train == 1:
-        run_training(args)
+        trained_model_path = run_training(args)
+        if bool(getattr(args, 'run_eval_after_train', 0)):
+            args.load_model = str(trained_model_path)
+            run_inference(args)
     else:
         run_inference(args)
 

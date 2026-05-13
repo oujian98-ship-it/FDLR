@@ -85,7 +85,7 @@ def experiment_log_dir(parent_path, log_kind, method, args, model_name=''):
 
 def perform_evaluation(real_path, fake_path, dataset_to_export=None, num_samples=100,
                        eval_log_dir=None, config_tag='', batch_size=256,
-                       compute_is=True, experiment_meta=None):
+                       compute_is=True, compute_pr=True, experiment_meta=None):
     """Run FID + IS + Precision/Recall evaluation and optionally log results."""
     import datetime
 
@@ -93,12 +93,15 @@ def perform_evaluation(real_path, fake_path, dataset_to_export=None, num_samples
         export_dataset(real_path, dataset_to_export, num_samples, train=False)
 
     fid_config = create_fid_config(paths=(real_path, fake_path), batch_size=batch_size)
-    precision_recall_config = create_precision_recall_config(path_real=real_path, path_fake=fake_path,
-                                                             num_samples=num_samples,
-                                                             batch_size=batch_size)
-
     _fid_result = calculate_fid(fid_config)
-    _pr_result = calculate_precision_recall(precision_recall_config)
+    _pr_result = None
+    if compute_pr:
+        precision_recall_config = create_precision_recall_config(path_real=real_path, path_fake=fake_path,
+                                                                 num_samples=num_samples,
+                                                                 batch_size=batch_size)
+        _pr_result = calculate_precision_recall(precision_recall_config)
+    else:
+        print('\nPrecision/Recall: skipped (compute_pr=False)')
     _is_result = None
     if compute_is:
         print('\nComputing Inception Score...')
@@ -117,8 +120,12 @@ def perform_evaluation(real_path, fake_path, dataset_to_export=None, num_samples
         print(f'  IS        : {_is_result[0]} +/- {_is_result[1]}')
     else:
         print('  IS        : skipped')
-    print(f'  Precision : {_pr_result[0]}')
-    print(f'  Recall    : {_pr_result[1]}')
+    if _pr_result is not None:
+        print(f'  Precision : {_pr_result[0]}')
+        print(f'  Recall    : {_pr_result[1]}')
+    else:
+        print('  Precision : skipped')
+        print('  Recall    : skipped')
 
     # ---- Save evaluation log ----
     if eval_log_dir:
@@ -130,7 +137,10 @@ def perform_evaluation(real_path, fake_path, dataset_to_export=None, num_samples
         else:
             log_name = f'{config_tag}_{ts}.log' if config_tag else f'eval_{ts}.log'
         log_path = eval_log_dir / log_name
-        with open(log_path, 'w', encoding='utf-8') as f:
+        append_log = log_path.exists()
+        with open(log_path, 'a' if append_log else 'w', encoding='utf-8') as f:
+            if append_log:
+                f.write('\n\n')
             f.write(f'Evaluation Log  {ts}\n')
             f.write(f'{"="*60}\n\n')
             f.write(f'Tag         : {config_tag}\n')
@@ -143,7 +153,7 @@ def perform_evaluation(real_path, fake_path, dataset_to_export=None, num_samples
             f.write(f'Batch size  : {batch_size}\n\n')
             f.write(f'FID Score   : {_fid_result}\n')
             f.write(f'IS Score    : {_is_result}\n')
-            f.write(f'Precision/Recall: {_pr_result}\n')
+            f.write(f'Precision/Recall: {_pr_result if _pr_result is not None else "skipped"}\n')
         print(f'\n[Evaluation log saved] {log_path}')
 
     return {
@@ -163,7 +173,7 @@ def record_training_time(parent_path, method, model_name, args, training_time_se
 
     detail_path = None
     if write_summary_log:
-        detail_dir = experiment_log_dir(parent_path, 'train_logs', method, args, model_name)
+        detail_dir = experiment_log_dir(parent_path, 'train_eval_logs', method, args, model_name)
         detail_path = detail_dir / f'{file_ts}.log'
         with open(detail_path, 'w', encoding='utf-8') as f:
             f.write(f'Training Log  {file_ts}\n')
@@ -173,6 +183,11 @@ def record_training_time(parent_path, method, model_name, args, training_time_se
             f.write(f'model_name: {model_name}\n')
             f.write(f'training_time_sec: {float(training_time_sec):.6f}\n')
             f.write(f'training_time_min: {float(training_time_sec) / 60.0:.6f}\n')
+            if args is not None:
+                f.write('\n[Training config]\n')
+                for key in sorted(vars(args).keys()):
+                    value = getattr(args, key)
+                    f.write(f'{key}: {value}\n')
             if extra_stats:
                 f.write('\n[Final stats]\n')
                 for key, value in extra_stats.items():

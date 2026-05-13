@@ -17,6 +17,9 @@ def args_parser():
     parser.add_argument('--train_mode', type=str, default='udec', help="training mode, can be (full, usplit, udec or ulatdec)")
 
     # diffusion arguments
+    parser.add_argument('--run_mode', type=str, default='',
+                        choices=['', 'train', 'eval', 'train_eval'],
+                        help='run mode: train, eval, or train_eval')
     parser.add_argument('--train', type=int, default=1,
                         help='Retrain the model instead of loading the checkpointed version')
     parser.add_argument('--load_model', type=str, default='',
@@ -72,8 +75,14 @@ def args_parser():
                         help='central aggregation interval for FedPhD-style communication reporting')
     parser.add_argument('--checkpoint_interval', type=int, default=10,
                         help='save intermediate checkpoints every N rounds; 0 saves only final model')
+    parser.add_argument('--run_eval_after_train', type=int, default=0,
+                        help='whether to export/evaluate immediately after training')
+    parser.add_argument('--log_timestamp', type=str, default='',
+                        help='optional fixed timestamp for train/eval log file')
     parser.add_argument('--compute_is', type=int, default=1,
                         help='whether to compute Inception Score')
+    parser.add_argument('--compute_pr', type=int, default=1,
+                        help='whether to compute Precision/Recall')
     parser.add_argument('--eval_real_split', type=str, default='train', choices=['train', 'test'],
                         help='which real split to export for FID/IS reference')
     parser.add_argument('--data_range', type=str, default='minus1_1', choices=['minus1_1', '0_1'],

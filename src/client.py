@@ -55,15 +55,12 @@ class Client(object):
             return
 
         if isinstance(training_task, SplitTrainingTask):
-            for name, param in self.local_model.named_parameters():
-                if is_up_parameter(name) and not training_task.up:
-                    param.requires_grad = False
-                elif is_mid_parameter(name) and not training_task.mid:
-                    param.requires_grad = False
-                elif is_down_parameter(name) and not training_task.down:
-                    param.requires_grad = False
-                else:
-                    param.requires_grad = True
+            # USplit reduces communication by reporting only the assigned
+            # network part. The local optimization itself remains full-model
+            # so encoder/bottleneck/decoder can co-adapt during each client
+            # update, matching the paper's "reporting task" description.
+            for _, param in self.local_model.named_parameters():
+                param.requires_grad = True
 
     def select_return_params(self, training_task):
         if training_task is None:

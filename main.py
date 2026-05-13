@@ -52,11 +52,12 @@ IID = 1                     # IID=1 / Non-IID=0
 UNEQUAL = 0                 # 非均匀分布=1
 
 # ---- 扩散模型超参 ----
+RUN_MODE = ''               # train | eval | train_eval；留空则兼容旧的 TRAIN_MODE
 TRAIN_MODE = 1              # 训练=1 / 推理=0
-LOAD_MODEL = ''             # 预加载模型路径 (留空自动根据数据集选择)
+LOAD_MODEL = ''             # 预加载模型路径；FedAvg 训练留空表示从随机初始化开始
 TIME_STEPS = 1000           # 扩散步数 T
 CONDITIONAL = -1            # 条件生成 (=-1按数据集自动: FMNIST=1, CelebA=0)
-LR = 1e-4                   # 学习率 (扩散模型建议不要超过 1e-4)
+LR = 0.01                   # 学习率
 OPTIMIZER = 'adam'          # 优化器
 MODEL_DIM = 0               # U-Net base channels；0 表示使用 image_size
 DIM_MULTS = '1,2,4'         # U-Net dim multipliers，例如 FedPhD 对齐可试 1,2,2,2
@@ -87,7 +88,10 @@ EVAL_NUM_SAMPLES = 30000    # FedPhD 对齐评估生成样本数
 EVAL_BATCH_SIZE = 256       # FedPhD 对齐评估 batch size
 CENTRAL_AGG_INTERVAL = 5    # FedPhD central aggregation 通信统计窗口
 CHECKPOINT_INTERVAL = 10    # 中间 checkpoint 保存间隔；0 表示只保存最终模型
-COMPUTE_IS = 1              # 评估时计算 Inception Score
+RUN_EVAL_AFTER_TRAIN = 0    # 训练完成后是否立刻导出/评估；0 表示训练和评估分开跑
+LOG_TIMESTAMP = ''          # 可手动指定日志文件时间戳；留空则自动生成
+COMPUTE_IS = 0              # 评估时计算 Inception Score
+COMPUTE_PR = 0              # 评估时计算 Precision/Recall
 EVAL_REAL_SPLIT = 'train'   # FedPhD-style 使用 train split 作为真实参考
 DATA_RANGE = 'minus1_1'     # minus1_1=协议范围；0_1=兼容旧 model_cifar.pth
 MODEL_BACKEND = 'custom'    # custom | diffusers
@@ -173,6 +177,51 @@ def auto_select_model(dataset_name):
         print(f'[Warning] Model file not found: {model_path}')
         return ''
     return config['default_model']
+
+
+def is_fedavg_training_from_scratch(args):
+    """FedAvg full/usplit/udec/ulatdec training starts from random init by default."""
+    return (
+        getattr(args, 'method', '') == 'fedavg'
+        and int(getattr(args, 'train', 1)) == 1
+        and getattr(args, 'train_mode', 'full') in {'full', 'usplit', 'udec', 'ulatdec'}
+    )
+
+
+def initial_load_model_for_config(method, train):
+    """Choose the config-level load model before CLI/preset overrides."""
+    if LOAD_MODEL:
+        return LOAD_MODEL
+    if method == 'fedavg' and int(train) == 1:
+        return ''
+    return auto_select_model(DATASET)
+
+
+def apply_run_mode(args):
+    """Map the clearer run_mode API onto legacy train/run_eval_after_train flags."""
+    run_mode = getattr(args, 'run_mode', '') or ''
+    if not run_mode:
+        return args
+
+    if run_mode == 'train':
+        args.train = 1
+        args.run_eval_after_train = 0
+    elif run_mode == 'eval':
+        args.train = 0
+        args.run_eval_after_train = 0
+    elif run_mode == 'train_eval':
+        args.train = 1
+        args.run_eval_after_train = 1
+    else:
+        raise ValueError(f'Unsupported --run_mode "{run_mode}". Use train, eval, or train_eval.')
+
+    if run_mode in {'eval', 'train_eval'}:
+        eval_count = int(getattr(args, 'eval_num_samples', 0) or 0)
+        if int(getattr(args, 'export_samples', 0) or 0) <= 0:
+            args.export_samples = eval_count
+        if int(getattr(args, 'export_dataset', 0) or 0) <= 0:
+            args.export_dataset = eval_count
+    return args
 
 
 # ============================================================
@@ -461,6 +510,7 @@ def build_args_from_config():
     args = argparse.Namespace(
         # 核心选择
         method=METHOD,
+        run_mode=RUN_MODE,
         preset='',
         # 数据集 (自动填充 image_size/num_channels/num_classes/data_root)
         dataset=DATASET,
@@ -484,7 +534,7 @@ def build_args_from_config():
         unequal=UNEQUAL,
         # 扩散模型
         train=TRAIN_MODE,
-        load_model=auto_select_model(DATASET),
+        load_model=initial_load_model_for_config(METHOD, TRAIN_MODE),
         resume_model='',
         start_round=0,
         cache_clients=0,
@@ -503,7 +553,10 @@ def build_args_from_config():
         eval_batch_size=ds_cfg.get('eval_batch_size', EVAL_BATCH_SIZE),
         central_agg_interval=CENTRAL_AGG_INTERVAL,
         checkpoint_interval=CHECKPOINT_INTERVAL,
+        run_eval_after_train=RUN_EVAL_AFTER_TRAIN,
+        log_timestamp=LOG_TIMESTAMP,
         compute_is=COMPUTE_IS,
+        compute_pr=COMPUTE_PR,
         eval_real_split=EVAL_REAL_SPLIT,
         data_range=DATA_RANGE,
         # LoRA
@@ -535,6 +588,7 @@ def apply_cli_overrides(args):
 
     # 只注册可覆盖的参数，不设 default（保留 args 中的值）
     parser.add_argument('--method', type=str)
+    parser.add_argument('--run_mode', type=str, choices=['train', 'eval', 'train_eval'])
     parser.add_argument('--preset', type=str, default='')
     parser.add_argument('--dataset', type=str)
     parser.add_argument('--model_backend', type=str)
@@ -573,7 +627,10 @@ def apply_cli_overrides(args):
     parser.add_argument('--eval_batch_size', type=int)
     parser.add_argument('--central_agg_interval', type=int)
     parser.add_argument('--checkpoint_interval', type=int)
+    parser.add_argument('--run_eval_after_train', type=int)
+    parser.add_argument('--log_timestamp', type=str)
     parser.add_argument('--compute_is', type=int)
+    parser.add_argument('--compute_pr', type=int)
     parser.add_argument('--eval_real_split', type=str)
     parser.add_argument('--data_range', type=str)
     parser.add_argument('--lora_rank', type=int)
@@ -611,6 +668,8 @@ def apply_cli_overrides(args):
         if val is not None:
             setattr(args, key, val)
 
+    args = apply_run_mode(args)
+
     # 如果通过 --dataset 切换了数据集，重新自动匹配
     if hasattr(args, 'dataset') and args.dataset:
         ds_cfg = get_dataset_config(args.dataset)
@@ -624,7 +683,11 @@ def apply_cli_overrides(args):
             args.num_classes = ds_cfg['num_classes']
         if '--conditional' not in sys.argv and not _is_preset_loaded:
             args.conditional = ds_cfg.get('conditional', 0)
-        if '--load_model' not in sys.argv and not getattr(args, 'load_model', ''):
+        explicit_load_model = '--load_model' in sys.argv
+        preset_load_model = 'load_model' in preset_keys
+        if is_fedavg_training_from_scratch(args) and not explicit_load_model and not preset_load_model and not LOAD_MODEL:
+            args.load_model = ''
+        elif not explicit_load_model and not preset_load_model and not getattr(args, 'load_model', ''):
             args.load_model = auto_select_model(args.dataset)
         if '--data_root' not in sys.argv and (not DATA_ROOT):
             args.data_root = ds_cfg.get('data_root', '')
@@ -639,7 +702,10 @@ def apply_cli_overrides(args):
 def print_config_summary(args):
     """打印当前运行配置摘要"""
     method_tag = 'LoRA-FedDiffuse' if args.method == 'lora' else 'FedAvg-Baseline'
-    mode_tag = 'TRAIN' if args.train == 1 else 'INFERENCE'
+    if args.train == 1 and bool(getattr(args, 'run_eval_after_train', 0)):
+        mode_tag = 'TRAIN+EVAL'
+    else:
+        mode_tag = 'TRAIN' if args.train == 1 else 'EVAL'
     ds_info = f"{args.dataset.upper()} {args.image_size}x{args.image_size} ch={args.num_channels}"
 
     extra = []
@@ -654,6 +720,8 @@ def print_config_summary(args):
         extra.append(f"mode={args.train_mode}")
     if getattr(args, 'partition', ''):
         extra.append(f"partition={args.partition}")
+    if getattr(args, 'run_mode', ''):
+        extra.append(f"run_mode={args.run_mode}")
     if getattr(args, 'model_backend', 'custom') != 'custom':
         extra.append(f"backend={args.model_backend}")
     if getattr(args, 'model_dim', 0):
